@@ -181,7 +181,7 @@ defaultGhciSettings opts =
 ghciWelcomeMsg :: String
 ghciWelcomeMsg = "Clashi, version " ++ Data.Version.showVersion Paths_clash_ghc.version ++
                  " (using clash-lib, version " ++ Data.Version.showVersion clashLibVersion ++
-                 "):\nhttp://www.clash-lang.org/  :? for help"
+                 "):\nhttps://clash-lang.org/  :? for help"
 
 ghciCommands :: IORef ClashOpts -> [Command]
 ghciCommands opts = map mkCmd [
@@ -1967,7 +1967,7 @@ makeHDL' :: Clash.Backend.Backend backend
          -> IORef ClashOpts
          -> [FilePath]
          -> InputT GHCi ()
-makeHDL' backend opts lst = makeHDL backend opts =<< case lst of
+makeHDL' backend opts lst = go =<< case lst of
   srcs@(_:_) -> return srcs
   []         -> do
     modGraph <- GHC.getModuleGraph
@@ -1975,6 +1975,32 @@ makeHDL' backend opts lst = makeHDL backend opts =<< case lst of
     return $ case (reverse sortedGraph) of
       ((AcyclicSCC top) : _) -> maybeToList $ (GHC.ml_hs_file . GHC.ms_location) top
       _                      -> []
+ where
+  go srcs = do
+    dflags <- GHC.getSessionDynFlags
+    goX dflags srcs `gfinally` recover dflags
+
+  goX dflags srcs = do
+    -- Issue #439 step 1
+    (dflagsX,_,_) <- parseDynamicFlagsCmdLine dflags
+                       [ noLoc "-fobject-code"   -- For #439
+                       , noLoc "-fforce-recomp"  -- Actually compile to object-code
+                       , noLoc "-keep-tmp-files" -- To prevent linker errors from
+                                                 -- multiple calls to :hdl command
+                       ]
+    _ <- GHC.setSessionDynFlags dflagsX
+    reloadModule ""
+    -- Issue #439 step 2
+    -- Unload any object files
+    -- This fixes: https://github.com/clash-lang/clash-compiler/issues/439#issuecomment-522015868
+    env <- GHC.getSession
+    liftIO (unload env [])
+    -- Finally generate the HDL
+    makeHDL backend opts srcs
+
+  recover dflags = do
+    _ <- GHC.setSessionDynFlags dflags
+    reloadModule ""
 
 makeHDL :: GHC.GhcMonad m
         => Clash.Backend.Backend backend

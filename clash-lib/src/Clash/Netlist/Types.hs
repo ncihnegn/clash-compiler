@@ -53,6 +53,7 @@ import Language.Haskell.TH.Syntax           (Lift)
 
 import SrcLoc                               (SrcSpan)
 
+import Clash.Annotations.BitRepresentation  (FieldAnn)
 import Clash.Annotations.TopEntity          (TopEntity)
 import Clash.Backend                        (Backend)
 import Clash.Core.Type                      (Type)
@@ -130,8 +131,14 @@ data NetlistState
   -- ^ Whether we're compiling a testbench (suppresses some warnings)
   , _backEndITE :: Bool
   -- ^ Whether the backend supports ifThenElse expressions
+  , _backend :: SomeBackend
+  -- ^ The current HDL backend
   , _htyCache :: HWMap
   }
+
+-- | Existentially quantified backend
+data SomeBackend where
+  SomeBackend :: Backend backend => backend -> SomeBackend
 
 -- | Signal reference
 type Identifier = Text
@@ -210,6 +217,9 @@ data HWType
   | CustomSum !Identifier !DataRepr' !Size [(ConstrRepr', Identifier)]
   -- ^ Same as Sum, but with a user specified bit representation. For more info,
   -- see: Clash.Annotations.BitRepresentations.
+  | CustomProduct !Identifier !DataRepr' !Size (Maybe [Text]) [(FieldAnn, HWType)]
+  -- ^ Same as Product, but with a user specified bit representation. For more
+  -- info, see: Clash.Annotations.BitRepresentations.
   | Annotated [Attr'] !HWType
   -- ^ Annotated with HDL attributes
   | KnownDomain !Identifier !Integer !ActiveEdge !ResetKind !InitBehavior !ResetPolarity
@@ -261,6 +271,7 @@ data Declaration
       WireOrReg                  -- FIELD Wire or register
       !Identifier                -- FIELD Name of signal
       (Either Identifier HWType) -- FIELD Pointer to type of signal or type of signal
+      (Maybe Expr)               -- FIELD Initial value
       -- ^ Signal declaration
   | TickDecl Comment
   -- ^ HDL tick corresponding to a Core tick
@@ -282,9 +293,9 @@ pattern NetDecl
   -> HWType
   -- ^ Type of signal
   -> Declaration
-pattern NetDecl note d ty <- NetDecl' note Wire d (Right ty)
+pattern NetDecl note d ty <- NetDecl' note Wire d (Right ty) _
   where
-    NetDecl note d ty = NetDecl' note Wire d (Right ty)
+    NetDecl note d ty = NetDecl' note Wire d (Right ty) Nothing
 
 data PortDirection = In | Out
   deriving (Eq,Ord,Show,Generic,NFData,Hashable)
@@ -320,6 +331,8 @@ data Expr
       !Bool                    -- FIELD Wrap in paretheses?
   | ConvBV     (Maybe Identifier) HWType Bool Expr
   | IfThenElse Expr Expr Expr
+  -- | Do nothing
+  | Noop
   deriving Show
 
 -- | Literals used in an expression
@@ -354,12 +367,12 @@ data BlackBoxContext
   { bbName      :: Text -- ^ Blackbox function name (for error reporting)
   , bbResult    :: (Expr,HWType) -- ^ Result name and type
   , bbInputs    :: [(Expr,HWType,Bool)] -- ^ Argument names, types, and whether it is a literal
-  , bbFunctions :: IntMap (Either BlackBox (Identifier,[Declaration])
+  , bbFunctions :: IntMap [(Either BlackBox (Identifier,[Declaration])
                           ,WireOrReg
                           ,[BlackBoxTemplate]
                           ,[BlackBoxTemplate]
                           ,[((Text,Text),BlackBox)]
-                          ,BlackBoxContext)
+                          ,BlackBoxContext)]
   -- ^ Function arguments (subset of inputs):
   --
   -- * ( Blackbox Template
@@ -373,6 +386,9 @@ data BlackBoxContext
   -- is equal to the scoping level of this context.
   , bbCompName :: Identifier
   -- ^ The component the BlackBox is instantiated in
+  , bbCtxName :: Maybe Identifier
+  -- ^ The "context name", name set by `Clash.Magic.setName`, defaults to the
+  -- name of the closest binder
   }
   deriving Show
 
@@ -415,6 +431,7 @@ emptyBBContext n
   , bbQsysIncName = []
   , bbLevel       = (-1)
   , bbCompName    = pack "__NOCOMPNAME__"
+  , bbCtxName     = Nothing
   }
 
 makeLenses ''NetlistEnv

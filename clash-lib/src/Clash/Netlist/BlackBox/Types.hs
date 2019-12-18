@@ -7,8 +7,14 @@
   Types used in BlackBox modules
 -}
 
+{-# LANGUAGE CPP            #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric  #-}
+
+-- since GHC 8.6 we can haddock individual contructor fields \o/
+#if __GLASGOW_HASKELL__ >= 806
+#define FIELD ^
+#endif
 
 module Clash.Netlist.BlackBox.Types
  ( BlackBoxMeta(..)
@@ -19,9 +25,11 @@ module Clash.Netlist.BlackBox.Types
  , Element(..)
  , Decl(..)
  , HdlSyn(..)
+ , RenderVoid(..)
  ) where
 
 import                Control.DeepSeq            (NFData)
+import                Data.Aeson                 (FromJSON)
 import                Data.Binary                (Binary)
 import                Data.Hashable              (Hashable)
 import                Data.Text.Lazy             (Text)
@@ -35,6 +43,15 @@ import {-# SOURCE #-} Clash.Netlist.Types
 
 import qualified      Clash.Signal.Internal      as Signal
 
+-- | Whether this primitive should be rendered when its result type is void.
+-- Defaults to 'NoRenderVoid'.
+data RenderVoid
+  = RenderVoid
+  -- ^ Render blackbox, even if result type is void
+  | NoRenderVoid
+  -- ^ Don't render blackbox result type is void. Default for all blackboxes.
+  deriving (Show, Generic, NFData, Binary, Hashable, FromJSON)
+
 data TemplateKind
   = TDecl
   | TExpr
@@ -44,16 +61,18 @@ data TemplateKind
 -- fields. (They are intentionally renamed to prevent name clashes.)
 data BlackBoxMeta =
   BlackBoxMeta { bbOutputReg :: Bool
-               , bbKind      :: TemplateKind
-               , bbLibrary   :: [BlackBoxTemplate]
-               , bbImports   :: [BlackBoxTemplate]
-               , bbIncludes  :: [((S.Text, S.Text), BlackBox)]
+               , bbKind :: TemplateKind
+               , bbLibrary :: [BlackBoxTemplate]
+               , bbImports :: [BlackBoxTemplate]
+               , bbFunctionPlurality :: [(Int, Int)]
+               , bbIncludes :: [((S.Text, S.Text), BlackBox)]
+               , bbRenderVoid :: RenderVoid
                }
 
 -- | Use this value in your blackbox template function if you do want to
 -- accept the defaults as documented in @Clash.Primitives.Types.BlackBox@.
 emptyBlackBoxMeta :: BlackBoxMeta
-emptyBlackBoxMeta = BlackBoxMeta False TExpr [] [] []
+emptyBlackBoxMeta = BlackBoxMeta False TExpr [] [] [] [] NoRenderVoid
 
 -- | A BlackBox function generates a blackbox template, given the inputs and
 -- result type of the function it should provide a blackbox for. This is useful
@@ -174,6 +193,9 @@ data Element
   | DevNull [Element]
   -- ^ Evaluate <hole> but swallow output
   | SigD [Element] !(Maybe Int)
+  | CtxName
+  -- ^ The "context name", name set by `Clash.Magic.setName`, defaults to the
+  -- name of the closest binder
   deriving (Show, Generic, NFData, Binary, Hashable)
 
 -- | Component instantiation hole. First argument indicates which function argument
@@ -183,7 +205,21 @@ data Element
 --
 -- The LHS of the tuple is the name of the signal, while the RHS of the tuple
 -- is the type of the signal
-data Decl = Decl !Int [(BlackBoxTemplate,BlackBoxTemplate)]
+data Decl
+  = Decl
+      !Int
+      -- FIELD Argument position of the function to instantiate
+      !Int
+      -- FIELD Subposition of function: blackboxes can request multiple instances
+      -- to be rendered of their given functions. This subposition indicates the
+      -- nth function instance to be rendered (zero-indexed).
+      --
+      -- This is a hack: the proper solution would postpone rendering the
+      -- function until the very last moment. The blackbox language has no way
+      -- to indicate the subposition, and every ~INST will default its subposition
+      -- to zero. Haskell blackboxes can use this data type.
+      [(BlackBoxTemplate,BlackBoxTemplate)]
+      -- FIELD (name of signal, type of signal)
   deriving (Show, Generic, NFData, Binary, Hashable)
 
 data HdlSyn = Vivado | Quartus | Other

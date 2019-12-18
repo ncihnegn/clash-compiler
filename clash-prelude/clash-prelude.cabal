@@ -1,3 +1,4 @@
+Cabal-version:        2.2
 Name:                 clash-prelude
 Version:              1.1.0
 Synopsis:             CAES Language for Synchronous Hardware - Prelude library
@@ -41,9 +42,9 @@ Description:
   A preliminary version of a tutorial can be found in "Clash.Tutorial", for a
   general overview of the library you should however check out "Clash.Prelude".
   Some circuit examples can be found in "Clash.Examples".
-Homepage:             http://www.clash-lang.org/
-bug-reports:          http://github.com/clash-lang/clash-prelude/issues
-License:              BSD2
+Homepage:             https://clash-lang.org/
+bug-reports:          https://github.com/clash-lang/clash-compiler/issues
+License:              BSD-2-Clause
 License-file:         LICENSE
 Author:               The Clash Authors
 Maintainer:           QBayLogic B.V. <devops@qbaylogic.com>
@@ -59,12 +60,20 @@ Extra-source-files:   README.md
 
 extra-doc-files:      doc/*.svg
 
-Cabal-version:        >=1.18
-Tested-with:          GHC == 8.2.2, GHC == 8.4.4, GHC == 8.6.5, GHC == 8.8.1
-
 source-repository head
   type: git
-  location: https://github.com/clash-lang/clash-prelude.git
+  location: https://github.com/clash-lang/clash-compiler.git
+  subdir: clash-prelude
+
+flag large-tuples
+  description:
+    Generate instances for classes such as `NFDataX` and `BitPack` for tuples
+    up to and including 62 elements - the GHC imposed maximum. This greatly
+    increases compile times for `clash-prelude` and therefore mostly impacts the
+    Clash developers themselves. Hence its default is set to disabled on
+    development versions and enabled on releases.
+  default: False
+  manual: True
 
 flag super-strict
   description:
@@ -109,6 +118,9 @@ Library
   ghc-options:        -Wall -fexpose-all-unfoldings -fno-worker-wrapper
   CPP-Options:        -DCABAL
 
+  if flag(large-tuples)
+    CPP-Options: -DLARGE_TUPLES
+
   if flag(super-strict)
     CPP-Options: -DCLASH_SUPER_STRICT
 
@@ -118,6 +130,8 @@ Library
   if flag(multiple-hidden)
     Exposed-modules:  Clash.Prelude.Synchronizer
 
+  Autogen-Modules:    Paths_clash_prelude
+
   Exposed-modules:    Clash.Annotations.TopEntity
                       Clash.Annotations.Primitive
                       Clash.Annotations.BitRepresentation
@@ -125,7 +139,9 @@ Library
                       Clash.Annotations.BitRepresentation.Internal
                       Clash.Annotations.BitRepresentation.Util
                       Clash.Annotations.SynthesisAttributes
+                      Clash.Annotations.TH
 
+                      Clash.Class.AutoReg
                       Clash.Class.BitPack
                       Clash.Class.Exp
                       Clash.Class.HasDomain
@@ -134,6 +150,7 @@ Library
                       Clash.Class.HasDomain.CodeGen
                       Clash.Class.HasDomain.Common
                       Clash.Class.Num
+                      Clash.Class.Parity
                       Clash.Class.Resize
 
                       Clash.Clocks
@@ -209,6 +226,7 @@ Library
                       Clash.Sized.Internal.Unsigned
 
                       Clash.XException
+                      Clash.XException.TH
 
                       Clash.Xilinx.ClockGen
                       Clash.Xilinx.DDR
@@ -216,7 +234,10 @@ Library
                       Clash.Tutorial
                       Clash.Examples
 
-  other-modules:      Clash.Class.BitPack.Internal
+  other-modules:
+                      Clash.Class.AutoReg.Instances
+                      Clash.Class.AutoReg.Internal
+                      Clash.Class.BitPack.Internal
                       Clash.CPP
                       Clash.Signal.Bundle.Internal
                       Language.Haskell.TH.Compat
@@ -263,18 +284,21 @@ Library
                       deepseq                   >= 1.4.1.0 && < 1.5,
                       ghc-prim                  >= 0.5.1.0 && < 0.6,
                       ghc-typelits-extra        >= 0.3.1   && < 0.4,
-                      ghc-typelits-knownnat     >= 0.6     && < 0.8,
+                      ghc-typelits-knownnat     >= 0.7.1   && < 0.8,
                       ghc-typelits-natnormalise >= 0.6     && < 0.8,
                       hashable                  >= 1.2.1.0  && < 1.4,
                       half                      >= 0.2.2.3 && < 1.0,
                       lens                      >= 4.9     && < 4.19,
+                      recursion-schemes         >= 5.1     && < 5.2,
                       QuickCheck                >= 2.7     && < 2.14,
                       reflection                >= 2       && < 2.2,
                       singletons                >= 1.0     && < 3.0,
                       template-haskell          >= 2.12.0.0 && < 2.16,
+                      th-abstraction            >= 0.2.10 && < 0.4.0,
                       th-lift                   >= 0.7.0    && < 0.9,
                       th-orphans                >= 0.13.1   && < 1.0,
                       text                      >= 0.11.3.1 && < 1.3,
+                      text-show                 >= 3.8     && < 3.9,
                       time                      >= 1.8     && < 1.10,
                       transformers              >= 0.5.2.0 && < 0.6,
                       type-errors               >= 0.2.0.0 && < 0.3,
@@ -316,14 +340,19 @@ test-suite unittests
       base,
       hint          >= 0.7      && < 0.10,
       tasty         >= 1.2      && < 1.3,
-      tasty-hunit
+      tasty-hunit,
+      tasty-quickcheck,
+      template-haskell
 
-  Other-Modules: Clash.Tests.BitPack
+  Other-Modules:
+                 Clash.Tests.AutoReg
+                 Clash.Tests.BitPack
                  Clash.Tests.BitVector
                  Clash.Tests.DerivingDataRepr
                  Clash.Tests.DerivingDataReprTypes
                  Clash.Tests.Signal
                  Clash.Tests.NFDataX
+                 Clash.Tests.TopEntityGeneration
 
 
 benchmark benchmark-clash-prelude

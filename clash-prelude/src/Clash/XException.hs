@@ -26,6 +26,7 @@ CallStack (from HasCallStack):
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE StandaloneDeriving    #-}
+{-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE TypeOperators         #-}
 
 {-# LANGUAGE Trustworthy #-}
@@ -40,28 +41,40 @@ module Clash.XException
     -- * Strict evaluation
   , seqX, forceX, deepseqX, rwhnfX, defaultSeqX
     -- * Structured undefined / deep evaluation with undefined values
-  , NFDataX (rnfX, deepErrorX)
+  , NFDataX (rnfX, deepErrorX, hasUndefined, ensureSpine)
   )
 where
 
-import Control.Exception (Exception, catch, evaluate, throw)
-import Control.DeepSeq   (NFData, rnf)
-import Data.Complex      (Complex)
-import Data.Either       (isLeft)
-import Data.Foldable     (toList)
-import Data.Int          (Int8,Int16,Int32,Int64)
-import Data.Ord          (Down (Down))
-import Data.Ratio        (Ratio, numerator, denominator)
-import qualified Data.Semigroup as SG
-import Data.Sequence     (Seq(Empty, (:<|)))
-import Data.Word         (Word8,Word16,Word32,Word64)
-import GHC.Exts          (Char (C#), Double (D#), Float (F#), Int (I#), Word (W#))
-import GHC.Generics
-import GHC.Natural       (Natural)
-import GHC.Show          (appPrec)
-import GHC.Stack         (HasCallStack, callStack, prettyCallStack, withFrozenCallStack)
-import Numeric.Half      (Half)
-import System.IO.Unsafe  (unsafeDupablePerformIO)
+import           Clash.CPP           (maxTupleSize)
+import           Clash.XException.TH
+import           Control.Exception   (Exception, catch, evaluate, throw)
+import           Control.DeepSeq     (NFData, rnf)
+import           Data.Complex        (Complex)
+import           Data.Either         (isLeft)
+import           Data.Foldable       (toList)
+import           Data.Int            (Int8, Int16, Int32, Int64)
+import           Data.Ord            (Down (Down))
+import           Data.Ratio          (Ratio, numerator, denominator)
+import qualified Data.Semigroup      as SG
+import           Data.Sequence       (Seq(Empty, (:<|)))
+import           Data.Word           (Word8, Word16, Word32, Word64)
+import           Foreign.C.Types     (CUShort)
+import           GHC.Exts
+  (Char (C#), Double (D#), Float (F#), Int (I#), Word (W#))
+import           GHC.Generics
+import           GHC.Natural         (Natural)
+import           GHC.Show            (appPrec)
+import           GHC.Stack
+  (HasCallStack, callStack, prettyCallStack, withFrozenCallStack)
+import           Numeric.Half        (Half)
+import           System.IO.Unsafe    (unsafeDupablePerformIO)
+
+-- $setup
+-- >>> import Clash.Class.BitPack (pack)
+-- >>> import Clash.Sized.Vector (Vec)
+-- >>> import Clash.Sized.RTree (RTree)
+-- >>> :set -fplugin GHC.TypeLits.Normalise
+-- >>> :set -fplugin GHC.TypeLits.KnownNat.Solver
 
 -- | An exception representing an \"uninitialized\" value.
 newtype XException = XException String
@@ -143,6 +156,8 @@ maybeIsX :: NFData a => a -> Maybe a
 maybeIsX = maybeX isX
 
 -- | Fully evaluate a value, returning @'Left' msg@ if it throws 'XException'.
+-- If you want to determine if a value contains undefined parts, use
+-- 'hasUndefined' instead.
 --
 -- > hasX 42                  = Right 42
 -- > hasX (XException msg)    = Left msg
@@ -263,41 +278,6 @@ genericShowsPrecX :: (Generic a, GShowX (Rep a)) => Int -> a -> ShowS
 genericShowsPrecX n = gshowsPrecX Pref n . from
 
 instance ShowX ()
-instance (ShowX a, ShowX b) => ShowX (a,b)
-instance (ShowX a, ShowX b, ShowX c) => ShowX (a,b,c)
-instance (ShowX a, ShowX b, ShowX c, ShowX d) => ShowX (a,b,c,d)
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e) => ShowX (a,b,c,d,e)
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e, ShowX f) => ShowX (a,b,c,d,e,f)
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e, ShowX f, ShowX g) => ShowX (a,b,c,d,e,f,g)
-
--- Show is defined up to 15-tuples, but GHC.Generics only has Generic instances
--- up to 7-tuples, hence we need these orphan instances.
-deriving instance Generic ((,,,,,,,) a b c d e f g h)
-deriving instance Generic ((,,,,,,,,) a b c d e f g h i)
-deriving instance Generic ((,,,,,,,,,) a b c d e f g h i j)
-deriving instance Generic ((,,,,,,,,,,) a b c d e f g h i j k)
-deriving instance Generic ((,,,,,,,,,,,) a b c d e f g h i j k l)
-deriving instance Generic ((,,,,,,,,,,,,) a b c d e f g h i j k l m)
-deriving instance Generic ((,,,,,,,,,,,,,) a b c d e f g h i j k l m n)
-deriving instance Generic ((,,,,,,,,,,,,,,) a b c d e f g h i j k l m n o)
-
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e, ShowX f, ShowX g, ShowX h) => ShowX (a,b,c,d,e,f,g,h)
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e, ShowX f, ShowX g, ShowX h, ShowX i) => ShowX (a,b,c,d,e,f,g,h,i)
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e, ShowX f, ShowX g, ShowX h, ShowX i, ShowX j)
-  => ShowX (a,b,c,d,e,f,g,h,i,j)
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e, ShowX f, ShowX g, ShowX h, ShowX i, ShowX j, ShowX k)
-  => ShowX (a,b,c,d,e,f,g,h,i,j,k)
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e, ShowX f, ShowX g, ShowX h, ShowX i, ShowX j, ShowX k, ShowX l)
-  => ShowX (a,b,c,d,e,f,g,h,i,j,k,l)
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e, ShowX f, ShowX g, ShowX h, ShowX i, ShowX j, ShowX k, ShowX l
-         ,ShowX m)
-  => ShowX (a,b,c,d,e,f,g,h,i,j,k,l,m)
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e, ShowX f, ShowX g, ShowX h, ShowX i, ShowX j, ShowX k, ShowX l
-         ,ShowX m, ShowX n)
-  => ShowX (a,b,c,d,e,f,g,h,i,j,k,l,m,n)
-instance (ShowX a, ShowX b, ShowX c, ShowX d, ShowX e, ShowX f, ShowX g, ShowX h, ShowX i, ShowX j, ShowX k, ShowX l
-         ,ShowX m, ShowX n, ShowX o)
-  => ShowX (a,b,c,d,e,f,g,h,i,j,k,l,m,n,o)
 
 instance {-# OVERLAPPABLE #-} ShowX a => ShowX [a] where
   showsPrecX _ = showListX
@@ -527,6 +507,34 @@ instance NFDataX1 f => GNFDataX One (Rec1 f) where
 instance (NFDataX1 f, GNFDataX One g) => GNFDataX One (f :.: g) where
   grnfX args = liftRnfX (grnfX args) . unComp1
 
+class GEnsureSpine f where
+  gEnsureSpine :: f a -> f a
+
+instance GEnsureSpine U1 where
+  gEnsureSpine _u = U1
+
+instance NFDataX a => GEnsureSpine (K1 i a) where
+  gEnsureSpine = K1 . ensureSpine . unK1
+  {-# INLINEABLE gEnsureSpine #-}
+
+instance GEnsureSpine a => GEnsureSpine (M1 i c a) where
+  gEnsureSpine a = M1 (gEnsureSpine (unM1 a))
+  {-# INLINEABLE gEnsureSpine #-}
+
+instance (GEnsureSpine a, GEnsureSpine b) => GEnsureSpine (a :*: b) where
+  gEnsureSpine ~(x :*: y) = gEnsureSpine x :*: gEnsureSpine y
+  {-# INLINEABLE gEnsureSpine #-}
+
+instance (GEnsureSpine a, GEnsureSpine b) => GEnsureSpine (a :+: b) where
+  gEnsureSpine lrx =
+    case lrx of
+      (L1 x) -> L1 (gEnsureSpine x)
+      (R1 x) -> R1 (gEnsureSpine x)
+  {-# INLINEABLE gEnsureSpine #-}
+
+instance GEnsureSpine V1 where
+  gEnsureSpine _ = error "Unreachable code?"
+
 -- | A class of functors that can be fully evaluated, according to semantics
 -- of NFDataX.
 class NFDataX1 f where
@@ -540,6 +548,47 @@ class NFDataX1 f where
   default liftRnfX :: (Generic1 f, GNFDataX One (Rep1 f)) => (a -> ()) -> f a -> ()
   liftRnfX r = grnfX (RnfArgs1 r) . from1
 
+
+class GHasUndefined f where
+  gHasUndefined :: f a -> Bool
+
+instance GHasUndefined U1 where
+  gHasUndefined u = if isLeft (isX u) then True else case u of U1 -> False
+
+instance NFDataX a => GHasUndefined (K1 i a) where
+  gHasUndefined = hasUndefined . unK1
+  {-# INLINEABLE gHasUndefined #-}
+
+instance GHasUndefined a => GHasUndefined (M1 i c a) where
+  gHasUndefined a =
+    -- Check for X needed to handle edge-case "data Void"
+    if isLeft (isX a) then
+      True
+    else
+      gHasUndefined (unM1 a)
+  {-# INLINEABLE gHasUndefined #-}
+
+instance (GHasUndefined a, GHasUndefined b) => GHasUndefined (a :*: b) where
+  gHasUndefined xy@(~(x :*: y)) =
+    if isLeft (isX xy) then
+      True
+    else
+      gHasUndefined x || gHasUndefined y
+  {-# INLINEABLE gHasUndefined #-}
+
+instance (GHasUndefined a, GHasUndefined b) => GHasUndefined (a :+: b) where
+  gHasUndefined lrx =
+    if isLeft (isX lrx) then
+      True
+    else
+      case lrx of
+        L1 x -> gHasUndefined x
+        R1 x -> gHasUndefined x
+  {-# INLINEABLE gHasUndefined #-}
+
+instance GHasUndefined V1 where
+  gHasUndefined _ = error "Unreachable code?"
+
 -- | Class that houses functions dealing with /undefined/ values in Clash. See
 -- 'deepErrorX' and 'rnfX'.
 class NFDataX a where
@@ -550,6 +599,40 @@ class NFDataX a where
   default deepErrorX :: (HasCallStack, Generic a, GDeepErrorX (Rep a)) => String -> a
   deepErrorX = withFrozenCallStack $ to . gDeepErrorX
 
+  -- | Determines whether any of parts of a given construct contain undefined
+  -- parts. Note that a negative answer does not mean its bit representation
+  -- is fully defined. For example:
+  --
+  -- >>> m = Nothing :: Maybe Bool
+  -- >>> hasUndefined m
+  -- False
+  -- >>> pack m
+  -- 0.
+  -- >>> hasUndefined (pack m)
+  -- True
+  --
+  hasUndefined :: a -> Bool
+
+  default hasUndefined :: (Generic a, GHasUndefined (Rep a)) => a -> Bool
+  hasUndefined = gHasUndefined . from
+
+  -- | Create a value where at the very least the spine is defined. For example:
+  --
+  -- >>> spined = ensureSpine (errorX "?" :: (Int, Int))
+  -- >>> case spined of (_, _) -> 'a'
+  -- 'a'
+  -- >>> fmap (const 'b') (ensureSpine undefined :: Vec 3 Int)
+  -- <'b','b','b'>
+  -- >>> fmap (const 'c') (ensureSpine undefined :: RTree 2 Int)
+  -- <<'c','c'>,<'c','c'>>
+  --
+  -- For users familiar with 'Clash.Sized.Vector.lazyV': this is the generalized
+  -- version of it.
+  ensureSpine :: a -> a
+
+  default ensureSpine :: (Generic a, GEnsureSpine (Rep a)) => a -> a
+  ensureSpine = to . gEnsureSpine . from
+
   -- | Evaluate a value to NF. As opposed to 'NFData's 'rnf', it does not bubble
   -- up 'XException's.
   rnfX :: a -> ()
@@ -558,52 +641,18 @@ class NFDataX a where
   rnfX = grnfX RnfArgs0 . from
 
 instance NFDataX ()
-instance (NFDataX a, NFDataX b) => NFDataX (a,b)
-instance (NFDataX a, NFDataX b, NFDataX c) => NFDataX (a,b,c)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d) => NFDataX (a,b,c,d)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e) => NFDataX (a,b,c,d,e)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e ,NFDataX f)
-  => NFDataX (a,b,c,d,e,f)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e
-         ,NFDataX f, NFDataX g)
-  => NFDataX (a,b,c,d,e,f,g)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e
-         ,NFDataX f, NFDataX g, NFDataX h)
-  => NFDataX (a,b,c,d,e,f,g,h)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e
-         ,NFDataX f, NFDataX g, NFDataX h, NFDataX i)
-  => NFDataX (a,b,c,d,e,f,g,h,i)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e
-         ,NFDataX f, NFDataX g, NFDataX h, NFDataX i, NFDataX j)
-  => NFDataX (a,b,c,d,e,f,g,h,i,j)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e
-         ,NFDataX f, NFDataX g, NFDataX h, NFDataX i, NFDataX j
-         ,NFDataX k)
-  => NFDataX (a,b,c,d,e,f,g,h,i,j,k)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e
-         ,NFDataX f, NFDataX g, NFDataX h, NFDataX i, NFDataX j
-         ,NFDataX k, NFDataX l)
-  => NFDataX (a,b,c,d,e,f,g,h,i,j,k,l)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e
-         ,NFDataX f, NFDataX g, NFDataX h, NFDataX i, NFDataX j
-         ,NFDataX k, NFDataX l, NFDataX m)
-  => NFDataX (a,b,c,d,e,f,g,h,i,j,k,l,m)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e
-         ,NFDataX f, NFDataX g, NFDataX h, NFDataX i, NFDataX j
-         ,NFDataX k, NFDataX l, NFDataX m, NFDataX n)
-  => NFDataX (a,b,c,d,e,f,g,h,i,j,k,l,m,n)
-instance (NFDataX a, NFDataX b, NFDataX c, NFDataX d, NFDataX e
-         ,NFDataX f, NFDataX g, NFDataX h, NFDataX i, NFDataX j
-         ,NFDataX k, NFDataX l, NFDataX m, NFDataX n, NFDataX o)
-  => NFDataX (a,b,c,d,e,f,g,h,i,j,k,l,m,n,o)
 
 instance NFDataX b => NFDataX (a -> b) where
   deepErrorX = pure . deepErrorX
   rnfX = rwhnfX
+  hasUndefined = error "hasUndefined on Undefined (a -> b): Not Yet Implemented"
+  ensureSpine = id
 
 instance NFDataX a => NFDataX (Down a) where
   deepErrorX = Down . deepErrorX
-  rnfX d@(~(Down x))= if isLeft (isX d) then rnfX x else ()
+  rnfX d@(~(Down x)) = if isLeft (isX d) then () else rnfX x
+  hasUndefined d@(~(Down x))= if isLeft (isX d) then True else hasUndefined x
+  ensureSpine ~(Down x) = Down (ensureSpine x)
 
 instance NFDataX Bool
 instance NFDataX a => NFDataX [a]
@@ -613,66 +662,104 @@ instance NFDataX a => NFDataX (Maybe a)
 instance NFDataX Char where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Double where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Float where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Int where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Int8 where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Int16 where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Int32 where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Int64 where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Integer where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Natural where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Word where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Word8 where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Word16 where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Word32 where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Word64 where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
+
+instance NFDataX CUShort where
+  deepErrorX = errorX
+  rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX Half where
   deepErrorX = errorX
   rnfX = rwhnfX
+  hasUndefined = isLeft . isX
+  ensureSpine = id
 
 instance NFDataX a => NFDataX (Seq a) where
   deepErrorX = errorX
@@ -681,10 +768,19 @@ instance NFDataX a => NFDataX (Seq a) where
    where
     go Empty = ()
     go (x :<| xs) = rnfX x `seq` go xs
+  ensureSpine = id
+
+  hasUndefined s =
+    if isLeft (isX s) then True else go s
+   where
+    go Empty = False
+    go (x :<| xs) = hasUndefined x || hasUndefined xs
 
 instance NFDataX a => NFDataX (Ratio a) where
   deepErrorX = errorX
   rnfX r = rnfX (numerator r) `seq` rnfX (denominator r)
+  hasUndefined r = isLeft (isX (numerator r)) || isLeft (isX (denominator r))
+  ensureSpine = id
 
 instance NFDataX a => NFDataX (Complex a) where
   deepErrorX = errorX
@@ -722,3 +818,6 @@ instance NFDataX c => GDeepErrorX (K1 i c) where
 
 instance GDeepErrorX (f :+: g) where
   gDeepErrorX = errorX
+
+mkShowXTupleInstances [2..maxTupleSize]
+mkNFDataXTupleInstances [2..maxTupleSize]

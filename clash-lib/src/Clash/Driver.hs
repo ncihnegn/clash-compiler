@@ -41,6 +41,7 @@ import           Data.Text.Prettyprint.Doc.Extra
    renderOneLine)
 import qualified Data.Time.Clock                  as Clock
 import qualified Language.Haskell.Interpreter     as Hint
+import qualified Language.Haskell.Interpreter.Extension as Hint
 import qualified Language.Haskell.Interpreter.Unsafe as Hint
 import qualified System.Directory                 as Directory
 import           System.Environment               (getExecutablePath)
@@ -50,7 +51,6 @@ import qualified System.IO                        as IO
 import           System.IO.Error                  (isDoesNotExistError)
 import           System.IO.Temp
   (getCanonicalTemporaryDirectory, withTempDirectory)
-import qualified Text.PrettyPrint.ANSI.Leijen     as ANSI
 import           Text.Trifecta.Result
   (Result(Success, Failure), _errDoc)
 import           Text.Read                        (readMaybe)
@@ -77,14 +77,14 @@ import           Clash.Netlist.Util               (genComponentName, genTopCompo
 import           Clash.Netlist.BlackBox.Parser    (runParse)
 import           Clash.Netlist.BlackBox.Types     (BlackBoxTemplate, BlackBoxFunction)
 import           Clash.Netlist.Types
-  (BlackBox (..), Component (..), Identifier, FilteredHWType, HWMap)
+  (BlackBox (..), Component (..), Identifier, FilteredHWType, HWMap, SomeBackend (..))
 import           Clash.Normalize                  (checkNonRecursive, cleanupGraph,
                                                    normalize, runNormalization)
 import           Clash.Normalize.Util             (callGraph)
 import           Clash.Primitives.Types
 import           Clash.Primitives.Util            (hashCompiledPrimMap)
 import           Clash.Unique                     (keysUniqMap, lookupUniqMap')
-import           Clash.Util                       (first, reportTimeDiff)
+import           Clash.Util                       (first, reportTimeDiff, wantedLanguageExtensions, unwantedLanguageExtensions)
 
 -- | Get modification data of current clash binary.
 getClashModificationDate :: IO Clock.UTCTime
@@ -243,7 +243,7 @@ generateHDL reprs bindingsMap hdlState primMap tcm tupTcm typeTrans eval
       -- Now start the netlist generation
       (netlist,seen') <-
         genNetlist False opts reprs transformedBindings topEntities primMap
-                   tcm typeTrans iw mkId extId ite seen hdlDir prefixM topEntity
+                   tcm typeTrans iw mkId extId ite (SomeBackend hdlState') seen hdlDir prefixM topEntity
 
       netlistTime <- netlist `deepseq` Clock.getCurrentTime
       let normNetDiff = reportTimeDiff netlistTime normTime
@@ -283,7 +283,7 @@ generateHDL reprs bindingsMap hdlState primMap tcm tupTcm typeTrans eval
       -- Now start the netlist generation
       (netlist,seen'') <-
         genNetlist True opts reprs transformedBindings topEntities primMap
-                   tcm typeTrans iw mkId extId ite seen' hdlDir prefixM tb
+                   tcm typeTrans iw mkId extId ite (SomeBackend hdlState') seen' hdlDir prefixM tb
 
       netlistTime <- netlist `deepseq` Clock.getCurrentTime
       let normNetDiff = reportTimeDiff netlistTime normTime
@@ -351,12 +351,17 @@ loadImportAndInterpret iPaths0 interpreterArgs topDir qualMod funcName typ = do
       Hint.unsafeRunInterpreterWithArgsLibdir interpreterArgs topDir $ do
         Hint.reset
         iPaths1 <- (iPaths0++) <$> Hint.get Hint.searchPath
-        Hint.set [Hint.searchPath Hint.:= iPaths1]
+        Hint.set [ Hint.searchPath Hint.:= iPaths1
+                 , Hint.languageExtensions Hint.:= langExts]
         Hint.loadModules [qualMod]
         Hint.setImports [ "Clash.Netlist.BlackBox.Types", "Clash.Netlist.Types", qualMod]
         Hint.unsafeInterpret funcName typ
     Right _ -> do
       return bbfE
+ where
+   langExts = map Hint.asExtension $
+                map show wantedLanguageExtensions ++
+                map ("No" ++ ) (map show unwantedLanguageExtensions)
 
 -- | Compiles blackbox functions and parses blackbox templates.
 compilePrimitive
@@ -410,12 +415,15 @@ compilePrimitive idirs pkgDbs topDir (BlackBoxHaskell bbName wf bbGenName source
     go args Nothing = do
       loadImportAndInterpret idirs args topDir qualMod funcName "BlackBoxFunction"
 
-compilePrimitive idirs pkgDbs topDir (BlackBox pNm wf tkind () oReg libM imps incs templ) = do
+compilePrimitive idirs pkgDbs topDir
+  (BlackBox pNm wf rVoid tkind () oReg libM imps fPlural incs rM riM templ) = do
   libM'  <- mapM parseTempl libM
   imps'  <- mapM parseTempl imps
   incs'  <- mapM (traverse parseBB) incs
   templ' <- parseBB templ
-  return (BlackBox pNm wf tkind () oReg libM' imps' incs' templ')
+  rM'    <- traverse parseBB rM
+  riM'   <- traverse parseBB riM
+  return (BlackBox pNm wf rVoid tkind () oReg libM' imps' fPlural incs' rM' riM' templ')
  where
   iArgs = concatMap (("-package-db":) . (:[])) pkgDbs
 
@@ -425,7 +433,8 @@ compilePrimitive idirs pkgDbs topDir (BlackBox pNm wf tkind () oReg libM imps in
     -> m BlackBoxTemplate
   parseTempl t = case runParse t of
     Failure errInfo
-      -> error (ANSI.displayS (ANSI.renderCompact (_errDoc errInfo)) "")
+      -> error ("Parsing template for blackbox " ++ Data.Text.unpack pNm ++ " failed:\n"
+               ++ show (_errDoc errInfo))
     Success t'
       -> pure t'
 

@@ -33,6 +33,7 @@ import           Control.Monad.Fail          (MonadFail)
 #endif
 import qualified Control.Monad.State.Strict  as State
 import qualified Control.Monad.Writer        as Writer
+import           Data.Bool                   (bool)
 import           Data.Bifunctor              (bimap)
 import           Data.Coerce                 (coerce)
 import           Data.Functor.Const          (Const (..))
@@ -78,9 +79,9 @@ import           Clash.Core.Var
   (Id, IdScope (..), TyVar, Var (..), isLocalId, mkGlobalId, mkLocalId, mkTyVar)
 import           Clash.Core.VarEnv
   (InScopeSet, VarEnv, elemVarSet, extendInScopeSetList, mkInScopeSet,
-   notElemVarEnv, uniqAway)
+   notElemVarEnv, uniqAway, uniqAway')
 import           Clash.Driver.Types
-  (DebugLevel (..))
+  (DebugLevel (..), BindingMap)
 import           Clash.Netlist.Util          (representableType)
 import           Clash.Rewrite.Types
 import           Clash.Unique
@@ -139,7 +140,6 @@ apply
   -- ^ Transformation to be applied
   -> Rewrite extra
 apply = \s rewrite ctx expr0 -> do
-  lvl <- Lens.view dbgLevel
   (expr1,anyChanged) <- Writer.listen (rewrite ctx expr0)
   let hasChanged = Monoid.getAny anyChanged
       !expr2     = if hasChanged then expr1 else expr0
@@ -160,14 +160,19 @@ apply = \s rewrite ctx expr0 -> do
                  }
     return ()
 #endif
+  lvl <- Lens.view dbgLevel
+  transformations <- Lens.view dbgTransformations
+
   if lvl == DebugNone
     then return expr2
-    else applyDebug lvl s expr0 hasChanged expr2
+    else applyDebug lvl transformations s expr0 hasChanged expr2
 {-# INLINE apply #-}
 
 applyDebug
   :: DebugLevel
   -- ^ The current debugging level
+  -> Set.Set String
+  -- ^ Transformations to debug
   -> String
   -- ^ Name of the transformation
   -> Term
@@ -177,7 +182,13 @@ applyDebug
   -> Term
   -- ^ New expression
   -> RewriteMonad extra Term
-applyDebug lvl name exprOld hasChanged exprNew =
+applyDebug lvl transformations name exprOld hasChanged exprNew
+  | not (Set.null transformations) =
+    let newLvl = bool DebugNone lvl (name `Set.member` transformations) in
+    applyDebug newLvl Set.empty name exprOld hasChanged exprNew
+
+applyDebug lvl _transformations name exprOld hasChanged exprNew =
+ traceIf (lvl == DebugTry) ("Trying: " ++ name) $
  traceIf (lvl >= DebugAll) ("Trying: " ++ name ++ " on:\n" ++ before) $ do
   Monad.when (lvl > DebugNone && hasChanged) $ do
     tcm                  <- Lens.view tcCache
@@ -281,7 +292,7 @@ mkDerivedName (TransformContext _ ctx) sf = case closestLetBinder ctx of
 
 -- | Make a new binder and variable reference for a term
 mkTmBinderFor
-  :: (Monad m, MonadUnique m, MonadFail m)
+  :: (MonadUnique m, MonadFail m)
   => InScopeSet
   -> TyConMap -- ^ TyCon cache
   -> Name a -- ^ Name of the new binder
@@ -293,25 +304,25 @@ mkTmBinderFor is tcm name e = do
 
 -- | Make a new binder and variable reference for either a term or a type
 mkBinderFor
-  :: (Monad m, MonadUnique m, MonadFail m)
+  :: (MonadUnique m, MonadFail m)
   => InScopeSet
   -> TyConMap -- ^ TyCon cache
   -> Name a -- ^ Name of the new binder
   -> Either Term Type -- ^ Type or Term to bind
   -> m (Either Id TyVar)
 mkBinderFor is tcm name (Left term) = do
-  name' <- cloneName name
+  name' <- cloneNameWithInScopeSet is name
   let ty = termType tcm term
-  return (Left (uniqAway is (mkLocalId ty (coerce name'))))
+  return (Left (mkLocalId ty (coerce name')))
 
 mkBinderFor is tcm name (Right ty) = do
-  name' <- cloneName name
+  name' <- cloneNameWithInScopeSet is name
   let ki = typeKind tcm ty
-  return (Right (uniqAway is (mkTyVar ki (coerce name'))))
+  return (Right (mkTyVar ki (coerce name')))
 
 -- | Make a new, unique, identifier
 mkInternalVar
-  :: (Monad m, MonadUnique m)
+  :: (MonadUnique m)
   => InScopeSet
   -> OccName
   -- ^ Name of the identifier
@@ -480,6 +491,53 @@ isConstantNotClockReset e = do
         _ -> return False
      else pure (isConstant e)
 
+-- TODO: Remove function after using WorkInfo in 'isWorkFreeIsh'
+isWorkFreeClockOrReset
+  :: TyConMap
+  -> Term
+  -> Maybe Bool
+isWorkFreeClockOrReset tcm e =
+  let eTy = termType tcm e in
+  if isClockOrReset tcm eTy then
+    case collectArgs e of
+      (Prim nm _,_) -> Just (nm == "Clash.Transformations.removedArg")
+      (Var _, []) -> Just True
+      _ -> Just False
+  else
+    Nothing
+
+-- | A conservative version of 'isWorkFree'. Is used to determine in 'bindConstantVar'
+-- to determine whether an expression can be "bound" (locally inlined). While
+-- binding workfree expressions won't result in extra work for the circuit, it
+-- might very well cause extra work for Clash. In fact, using 'isWorkFree' in
+-- 'bindConstantVar' makes Clash two orders of magnitude slower for some of our
+-- test cases.
+--
+-- In effect, this function is a version of 'isConstant' that also considers
+-- references to clocks and resets constant. This allows us to bind
+-- HiddenClock(ResetEnable) constructs, allowing Clash to constant spec
+-- subconstants - most notably KnownDomain. Doing that enables Clash to
+-- eliminate any case-constructs on it.
+isWorkFreeIsh
+  :: Term
+  -> RewriteMonad extra Bool
+isWorkFreeIsh e = do
+  tcm <- Lens.view tcCache
+  case isWorkFreeClockOrReset tcm e of
+    Just b -> pure b
+    Nothing ->
+      case collectArgs e of
+        (Data _, args)   -> allM isWorkFreeIshArg args
+        (Prim _ pInfo, args) -> case primWorkInfo pInfo of
+          WorkAlways     -> pure False -- Things like clock or reset generator always
+                                       -- perform work
+          _              -> allM isWorkFreeIshArg args
+        (Lam _ _, _)     -> pure (not (hasLocalFreeVars e))
+        (Literal _,_)    -> pure True
+        _                -> pure False
+ where
+  isWorkFreeIshArg = either isWorkFreeIsh (pure . const True)
+
 inlineOrLiftBinders
   :: (LetBinding -> RewriteMonad extra Bool)
   -- ^ Property test
@@ -535,7 +593,11 @@ liftBinding (var@Id {varName = idName} ,e) = do
   tcm       <- Lens.view tcCache
   let newBodyTy = termType tcm $ mkTyLams (mkLams e boundFVs) boundFTVs
   (cf,sp)   <- Lens.use curFun
-  newBodyNm <- cloneName (appendToName (varName cf) ("_" `Text.append` nameOcc idName))
+  binders <- Lens.use bindings
+  newBodyNm <-
+    cloneNameWithBindingMap
+      binders
+      (appendToName (varName cf) ("_" `Text.append` nameOcc idName))
   let newBodyId = mkGlobalId newBodyTy newBodyNm {nameSort = Internal}
 
   -- Make a new expression, consisting of the the lifted function applied to
@@ -586,6 +648,14 @@ liftBinding (var@Id {varName = idName} ,e) = do
 
 liftBinding _ = error $ $(curLoc) ++ "liftBinding: invalid core, expr bound to tyvar"
 
+-- | Ensure that the 'Unique' of a variable does not occur in the 'BindingMap'
+uniqAwayBinder
+  :: BindingMap
+  -> Name a
+  -> Name a
+uniqAwayBinder binders nm =
+  uniqAway' (`elemUniqMapDirectly` binders) (nameUniq nm) nm
+
 -- | Make a global function for a name-term tuple
 mkFunction
   :: TmName
@@ -597,9 +667,10 @@ mkFunction
   -> RewriteMonad extra Id
   -- ^ Name with a proper unique and the type of the function
 mkFunction bndrNm sp inl body = do
-  tcm    <- Lens.view tcCache
+  tcm <- Lens.view tcCache
   let bodyTy = termType tcm body
-  bodyNm <- cloneName bndrNm
+  binders <- Lens.use bindings
+  bodyNm <- cloneNameWithBindingMap binders bndrNm
   addGlobalBind bodyNm bodyTy sp inl body
   return (mkGlobalId bodyTy bodyNm)
 
@@ -615,14 +686,27 @@ addGlobalBind vNm ty sp inl body = do
   let vId = mkGlobalId ty vNm
   (ty,body) `deepseq` bindings %= extendUniqMap vNm (vId,sp,inl,body)
 
--- | Create a new name out of the given name, but with another unique
-cloneName
-  :: (Monad m, MonadUnique m)
-  => Name a
+-- | Create a new name out of the given name, but with another unique. Resulting
+-- unique is guaranteed to not be in the given InScopeSet.
+cloneNameWithInScopeSet
+  :: (MonadUnique m)
+  => InScopeSet
+  -> Name a
   -> m (Name a)
-cloneName nm = do
+cloneNameWithInScopeSet is nm = do
   i <- getUniqueM
-  return nm {nameUniq = i}
+  return (uniqAway is (setUnique nm i))
+
+-- | Create a new name out of the given name, but with another unique. Resulting
+-- unique is guaranteed to not be in the given BindingMap.
+cloneNameWithBindingMap
+  :: (MonadUnique m)
+  => BindingMap
+  -> Name a
+  -> m (Name a)
+cloneNameWithBindingMap binders nm = do
+  i <- getUniqueM
+  return (uniqAway' (`elemUniqMapDirectly` binders) i (setUnique nm i))
 
 {-# INLINE isUntranslatable #-}
 -- | Determine if a term cannot be represented in hardware
@@ -655,7 +739,7 @@ isUntranslatableType stringRepresentable ty =
 
 -- | Make a binder that should not be referenced
 mkWildValBinder
-  :: (Monad m, MonadUnique m)
+  :: (MonadUnique m)
   => InScopeSet
   -> Type
   -> m Id
@@ -664,7 +748,7 @@ mkWildValBinder is = mkInternalVar is "wild"
 -- | Make a case-decomposition that extracts a field out of a (Sum-of-)Product type
 mkSelectorCase
   :: HasCallStack
-  => (Functor m, Monad m, MonadUnique m)
+  => (Functor m, MonadUnique m)
   => String -- ^ Name of the caller of this function
   -> InScopeSet
   -> TyConMap -- ^ TyCon cache

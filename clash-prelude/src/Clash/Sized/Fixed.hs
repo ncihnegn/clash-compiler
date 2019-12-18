@@ -39,6 +39,7 @@ BEWARE: rounding by truncation introduces a sign bias!
 
 {-# LANGUAGE Trustworthy #-}
 
+{-# OPTIONS_GHC -fplugin=GHC.TypeLits.Normalise #-}
 {-# OPTIONS_GHC -fplugin GHC.TypeLits.KnownNat.Solver #-}
 {-# OPTIONS_HADDOCK show-extensions #-}
 
@@ -279,6 +280,8 @@ instance ( size ~ (int + frac), KnownNat frac, Integral (rep size)
 instance NFDataX (rep (int + frac)) => NFDataX (Fixed rep int frac) where
   deepErrorX = Fixed . errorX
   rnfX f@(~(Fixed x)) = if isLeft (isX f) then () else rnfX x
+  hasUndefined f@(~(Fixed x)) = if isLeft (isX f) then True else hasUndefined x
+  ensureSpine ~(Fixed x) = Fixed x
 
 -- | None of the 'Read' class' methods are synthesizable.
 instance (size ~ (int + frac), KnownNat frac, Bounded (rep size), Integral (rep size))
@@ -435,7 +438,6 @@ type NumFixedC rep int frac
               (int + ((int + frac) + frac))
     , BitPack (rep ((int + int) + (frac + frac)))
     , Bits    (rep ((int + int) + (frac + frac)))
-    , KnownNat (BitSize (rep (int + frac)))
     , BitPack (rep (int + frac))
     , Enum    (rep (int + frac))
     , Bits    (rep (int + frac))

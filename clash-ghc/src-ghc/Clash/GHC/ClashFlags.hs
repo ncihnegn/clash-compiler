@@ -14,15 +14,20 @@ module Clash.GHC.ClashFlags
   )
 where
 
-import CmdLineParser
-import Panic
-import SrcLoc
+import           CmdLineParser
+import           Panic
+import           SrcLoc
 
-import Data.IORef
-import Control.Monad
-import Clash.Driver.Types
-import Clash.Netlist.BlackBox.Types (HdlSyn (..))
-import Text.Read (readMaybe)
+import           Control.Monad
+import           Data.Char                      (isSpace)
+import           Data.IORef
+import           Data.List                      (dropWhileEnd)
+import           Data.List.Split                (splitOn)
+import qualified Data.Set                       as Set
+import           Text.Read                      (readMaybe)
+
+import           Clash.Driver.Types
+import           Clash.Netlist.BlackBox.Types   (HdlSyn (..))
 
 parseClashFlags :: IORef ClashOpts -> [Located String]
                 -> IO ([Located String]
@@ -57,6 +62,7 @@ parseClashFlagsFull flagsAvialable args = do
 flagsClash :: IORef ClashOpts -> [Flag IO]
 flagsClash r = [
     defFlag "fclash-debug"                       $ SepArg (setDebugLevel r)
+  , defFlag "fclash-debug-transformations"       $ SepArg (setDebugTransformations r)
   , defFlag "fclash-hdldir"                      $ SepArg (setHdlDir r)
   , defFlag "fclash-hdlsyn"                      $ SepArg (setHdlSyn r)
   , defFlag "fclash-nocache"                     $ NoArg (deprecated "nocache" "no-cache" setNoCache r)
@@ -78,6 +84,7 @@ flagsClash r = [
   , defFlag "fclash-no-escaped-identifiers"      $ NoArg (liftEwM (setNoEscapedIds r))
   , defFlag "fclash-compile-ultra"               $ NoArg (liftEwM (setUltra r))
   , defFlag "fclash-force-undefined"             $ OptIntSuffix (setUndefined r)
+  , defFlag "fclash-aggressive-x-optimization"   $ NoArg (liftEwM (setAggressiveXOpt r))
   ]
 
 -- | Print deprecated flag warning
@@ -117,6 +124,13 @@ setSpecLimit :: IORef ClashOpts
              -> Int
              -> IO ()
 setSpecLimit r n = modifyIORef r (\c -> c {opt_specLimit = n})
+
+setDebugTransformations :: IORef ClashOpts -> String -> EwM IO ()
+setDebugTransformations r s =
+  liftEwM (modifyIORef r (\c -> c {opt_dbgTransformations = transformations}))
+ where
+  transformations = Set.fromList (filter (not . null) (map trim (splitOn "," s)))
+  trim = dropWhileEnd isSpace . dropWhile isSpace
 
 setDebugLevel :: IORef ClashOpts
               -> String
@@ -196,3 +210,7 @@ setUndefined _ (Just x) | x < 0 || x > 1 =
            " not in range [0,1]")
 setUndefined r iM =
   liftEwM (modifyIORef r (\c -> c {opt_forceUndefined = Just iM}))
+
+setAggressiveXOpt :: IORef ClashOpts -> IO ()
+setAggressiveXOpt r = modifyIORef r (\c -> c { opt_aggressiveXOpt = True })
+

@@ -11,6 +11,7 @@
 {-# LANGUAGE DeriveGeneric         #-}
 {-# LANGUAGE ExplicitForAll        #-}
 {-# LANGUAGE GADTs                 #-}
+{-# LANGUAGE NamedFieldPuns        #-}
 {-# LANGUAGE RankNTypes            #-}
 
 module Clash.Core.Var
@@ -68,29 +69,38 @@ data Var a
   = TyVar
   { varName :: !(Name a)
   , varUniq :: {-# UNPACK #-} !Unique
+  -- ^ Invariant: forall x . varUniq x ~ nameUniq (varName x)
   , varType :: Kind
   }
   -- | Constructor for term variables
   | Id
   { varName :: !(Name a)
   , varUniq :: {-# UNPACK #-} !Unique
+  -- ^ Invariant: forall x . varUniq x ~ nameUniq (varName x)
   , varType :: Type
   , idScope :: IdScope
   }
   deriving (Show,Generic,NFData,Hashable,Binary)
 
+-- | Gets a _key_ in the DBMS sense: a value that uniquely identifies a
+-- Var. In case of a "Var" that is its unique and (if applicable) scope
+varKey :: Var a -> (Unique, Maybe IdScope)
+varKey TyVar{varUniq} = (varUniq, Nothing)
+varKey Id{varUniq,idScope} = (varUniq, Just idScope)
+
 instance Eq (Var a) where
-  (==) = (==) `on` varUniq
-  (/=) = (/=) `on` varUniq
+  (==) = (==) `on` varKey
+  (/=) = (/=) `on` varKey
 
 instance Ord (Var a) where
-  compare = compare `on` varUniq
+  compare = compare `on` varKey
 
 instance Uniquable (Var a) where
   getUnique = varUniq
+  setUnique var u = var {varUniq=u, varName=(varName var){nameUniq=u}}
 
 data IdScope = GlobalId | LocalId
-  deriving (Show,Generic,NFData,Hashable,Binary)
+  deriving (Show,Generic,NFData,Hashable,Binary,Eq,Ord)
 
 -- | Term variable
 type Id    = Var Term

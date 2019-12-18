@@ -18,6 +18,7 @@ module Clash.Primitives.Util
   , hashCompiledPrimMap
   , constantArgs
   , decodeOrErr
+  , getFunctionPlurality
   ) where
 
 import           Control.DeepSeq        (force)
@@ -28,7 +29,8 @@ import qualified Data.HashMap.Lazy      as HashMap
 import qualified Data.HashMap.Strict    as HashMapStrict
 import qualified Data.Set               as Set
 import           Data.Hashable          (hash)
-import           Data.List              (isSuffixOf, sort)
+import           Data.List              (isSuffixOf, sort, find)
+import           Data.Maybe             (fromMaybe)
 import qualified Data.Text              as TS
 import           Data.Text.Lazy         (Text)
 import qualified Data.Text.Lazy.IO      as T
@@ -40,15 +42,18 @@ import           System.IO.Error        (tryIOError)
 import           Clash.Annotations.Primitive
   ( PrimitiveGuard(HasBlackBox, WarnNonSynthesizable, WarnAlways, DontTranslate)
   , extractPrim)
+import           Clash.Core.Term        (Term)
+import           Clash.Core.Type        (Type)
 import           Clash.Primitives.Types
   ( Primitive(BlackBox), CompiledPrimitive, ResolvedPrimitive, ResolvedPrimMap
   , includes, template, TemplateSource(TFile, TInline), Primitive(..)
   , UnresolvedPrimitive, CompiledPrimMap, GuardedResolvedPrimitive)
-import           Clash.Netlist.Types    (BlackBox(..))
+import           Clash.Netlist.Types    (BlackBox(..), NetlistMonad)
+import           Clash.Netlist.Util     (preserveState)
 import           Clash.Netlist.BlackBox.Util
   (walkElement)
 import           Clash.Netlist.BlackBox.Types
-  (Element(Const, Lit))
+  (Element(Const, Lit), BlackBoxMeta(..))
 
 hashCompiledPrimitive :: CompiledPrimitive -> Int
 hashCompiledPrimitive (Primitive {name, primSort}) = hash (name, primSort)
@@ -89,10 +94,13 @@ resolvePrimitive'
   -> IO (TS.Text, GuardedResolvedPrimitive)
 resolvePrimitive' _metaPath (Primitive name wf primType) =
   return (name, HasBlackBox (Primitive name wf primType))
-resolvePrimitive' metaPath BlackBox{template=t, includes=i, ..} = do
-  let resolvedIncludes = mapM (traverse (traverse (traverse (resolveTemplateSource metaPath)))) i
-      resolved         = traverse (traverse (resolveTemplateSource metaPath)) t
-  bb <- BlackBox name workInfo kind () outputReg libraries imports <$> resolvedIncludes <*> resolved
+resolvePrimitive' metaPath BlackBox{template=t, includes=i, resultName=r, resultInit=ri, ..} = do
+  let resolveSourceM = traverse (traverse (resolveTemplateSource metaPath))
+  bb <- BlackBox name workInfo renderVoid kind () outputReg libraries imports functionPlurality
+          <$> mapM (traverse resolveSourceM) i
+          <*> traverse resolveSourceM r
+          <*> traverse resolveSourceM ri
+          <*> resolveSourceM t
   case warning of
     Just w  -> pure (name, WarnNonSynthesizable (TS.unpack w) bb)
     Nothing -> pure (name, HasBlackBox bb)
@@ -172,9 +180,15 @@ generatePrimMap unresolvedPrims primGuards filePaths = do
 
 -- | Determine what argument should be constant / literal
 constantArgs :: TS.Text -> CompiledPrimitive -> Set.Set Int
-constantArgs nm BlackBox {template = BBTemplate template} =
-  Set.fromList (fromIntForce ++ concatMap (walkElement getConstant) template)
+constantArgs nm BlackBox {template = templ@(BBTemplate _), resultInit = tRIM} =
+  Set.fromList (concat [ fromIntForce
+                       , maybe [] walkTemplate tRIM
+                       , walkTemplate templ
+                       ])
  where
+  walkTemplate (BBTemplate t) = concatMap (walkElement getConstant) t
+  walkTemplate _ = []
+
   getConstant (Lit i)      = Just i
   getConstant (Const i)    = Just i
   getConstant _            = Nothing
@@ -205,3 +219,37 @@ constantArgs nm BlackBox {template = BBTemplate template} =
     | nm == "Clash.Sized.Vector.replace_int"               = [1,2]
     | otherwise = []
 constantArgs _ _ = Set.empty
+
+-- | Helper function of 'getFunctionPlurality'
+getFunctionPlurality' :: [(Int, Int)] -> Int -> Int
+getFunctionPlurality' functionPlurality n =
+  fromMaybe 1 (snd <$> (find ((== n) . fst) functionPlurality))
+
+-- | Looks up the plurality of a function's function argument. See
+-- 'functionPlurality' for more information. If not set, the returned plurality
+-- will default to /1/.
+getFunctionPlurality
+  :: HasCallStack
+  => CompiledPrimitive
+  -> [Either Term Type]
+  -- ^ Arguments passed to blackbox
+  -> Type
+  -- ^ Result type
+  -> Int
+  -- ^ Argument number holding the function of interest
+  -> NetlistMonad Int
+  -- ^ Plurality of function. Defaults to 1. Does not err if argument isn't
+  -- a function in the first place. State of monad will not be modified.
+getFunctionPlurality (Primitive {}) _args _resTy _n = pure 1
+getFunctionPlurality (BlackBoxHaskell {name, function, functionName}) args resTy n = do
+  errOrMeta <- preserveState ((snd function) False name args resTy)
+  case errOrMeta of
+    Left err ->
+      error $ concat [ "Tried to determine function plurality for "
+                     , TS.unpack name, " by quering ", show functionName
+                     , ". Function returned an error message instead:\n\n"
+                     , err ]
+    Right (BlackBoxMeta {bbFunctionPlurality}, _bb) ->
+      pure (getFunctionPlurality' bbFunctionPlurality n)
+getFunctionPlurality (BlackBox {functionPlurality}) _args _resTy n =
+  pure (getFunctionPlurality' functionPlurality n)

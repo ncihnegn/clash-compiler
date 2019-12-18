@@ -35,6 +35,7 @@
 {-# LANGUAGE CPP               #-}
 {-# LANGUAGE DataKinds         #-}
 {-# LANGUAGE FlexibleContexts  #-}
+{-# LANGUAGE MonoLocalBinds    #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE TypeOperators     #-}
 
@@ -133,9 +134,12 @@ module Clash.Prelude
   , Lift (..)
     -- ** Type classes
     -- *** Clash
+  -- , module Clash.Class.AutoReg
+  , autoReg, deriveAutoReg
   , module Clash.Class.BitPack
   , module Clash.Class.Exp
   , module Clash.Class.Num
+  , module Clash.Class.Parity
   , module Clash.Class.Resize
     -- *** Other
   , module Control.Applicative
@@ -159,15 +163,18 @@ where
 import           Control.Applicative
 import           Data.Bits
 import           Data.Default.Class
+import           GHC.Stack                   (HasCallStack)
 import           GHC.TypeLits
 import           GHC.TypeLits.Extra
 import           Language.Haskell.TH.Syntax  (Lift(..))
 import           Clash.HaskellPrelude
 
 import           Clash.Annotations.TopEntity
+import           Clash.Class.AutoReg         (AutoReg, deriveAutoReg)
 import           Clash.Class.BitPack
 import           Clash.Class.Exp
 import           Clash.Class.Num
+import           Clash.Class.Parity
 import           Clash.Class.Resize
 import qualified Clash.Explicit.Prelude      as E
 import           Clash.Hidden
@@ -207,12 +214,13 @@ import           Clash.XException
 
 {- $hiding
 "Clash.Prelude" re-exports most of the Haskell "Prelude" with the exception of
-the following: (++), (!!), concat, drop, foldl, foldl1, foldr, foldr1, head,
-init, iterate, last, length, map, repeat, replicate, reverse, scanl, scanr,
+the following: (++), (!!), concat, drop, even, foldl, foldl1, foldr, foldr1, head,
+init, iterate, last, length, map, odd, repeat, replicate, reverse, scanl, scanr,
 splitAt, tail, take, unzip, unzip3, zip, zip3, zipWith, zipWith3.
 
 It instead exports the identically named functions defined in terms of
-'Clash.Sized.Vector.Vec' at "Clash.Sized.Vector".
+'Clash.Sized.Vector.Vec' at "Clash.Sized.Vector". For the 'odd' end 'even'
+function a type class called Parity is available at 'Clash.Class.Parity'.
 -}
 
 
@@ -259,3 +267,11 @@ windowD
   -- ^ Window of at least size 1
 windowD = hideClockResetEnable E.windowD
 {-# INLINE windowD #-}
+
+-- | Implicit version of 'Clash.Class.AutoReg.autoReg'
+autoReg
+  :: (HasCallStack, HiddenClockResetEnable dom, AutoReg a)
+  => a
+  -> Signal dom a
+  -> Signal dom a
+autoReg = hideClockResetEnable E.autoReg

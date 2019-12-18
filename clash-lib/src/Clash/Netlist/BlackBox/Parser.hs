@@ -55,13 +55,13 @@ pEdge =
 pTagD :: Parser Element
 pTagD =  IF <$> (symbol "~IF" *> pTagE)
             <*> (spaces *> (string "~THEN" *> pBlackBoxD))
-            <*> (string "~ELSE" *> pBlackBoxD <* string "~FI")
+            <*> (string "~ELSE" *> option ([Text ""]) pBlackBoxD <* string "~FI")
      <|> Component <$> pDecl
      <|> pTagE
 
 -- | Parse a Declaration
 pDecl :: Parser Decl
-pDecl = Decl <$> (symbol "~INST" *> natural') <*>
+pDecl = Decl <$> (symbol "~INST" *> natural') <*> pure 0 <*>
         ((:) <$> pOutput <*> many pInput) <* string "~INST"
 
 -- | Parse the output tag of Declaration
@@ -129,6 +129,7 @@ pTagE =  Result True       <$  string "~ERESULT"
      <|> ActiveEdge        <$> (string "~ACTIVEEDGE" *> brackets pEdge) <*> brackets' natural'
      <|> IsSync            <$> (string "~ISSYNC" *> brackets' natural')
      <|> IsInitDefined     <$> (string "~ISINITDEFINED" *> brackets' natural')
+     <|> CtxName           <$  string "~CTXNAME"
 
 natural' :: TokenParsing m => m Int
 natural' = fmap fromInteger natural

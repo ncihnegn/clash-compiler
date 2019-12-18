@@ -29,7 +29,9 @@ import Clash.Rewrite.Util
 -- | Normalisation transformation
 normalization :: NormRewrite
 normalization = rmDeadcode >-> constantPropagation >-> etaTL >-> rmUnusedExpr >-!-> anf >-!-> rmDeadcode >->
-                bindConst >-> letTL >-> evalConst >-!-> cse >-!-> cleanup >-> recLetRec
+                bindConst >-> letTL >-> evalConst >-!-> cse >-!-> cleanup >->
+                xOptim >-> rmDeadcode >->
+                cleanup >-> recLetRec >-> splitArgs
   where
     etaTL      = apply "etaTL" etaExpansionTL !-> topdownR (apply "applicationPropagation" appPropFast)
     anf        = topdownR (apply "nonRepANF" nonRepANF) >-> apply "ANF" makeANF >-> topdownR (apply "caseCon" caseCon)
@@ -41,12 +43,15 @@ normalization = rmDeadcode >-> constantPropagation >-> etaTL >-> rmUnusedExpr >-
     -- See [Note] bottomup traversal evalConst:
     evalConst  = bottomupR (apply "evalConst" reduceConst)
     cse        = topdownR (apply "CSE" simpleCSE)
+    xOptim     = bottomupR (apply "xOptimize" xOptimize)
     cleanup    = topdownR (apply "etaExpandSyn" etaExpandSyn) >->
                  topdownSucR (apply "inlineCleanup" inlineCleanup) !->
                  innerMost (applyMany [("caseCon"        , caseCon)
                                       ,("bindConstantVar", bindConstantVar)
                                       ,("letFlat"        , flattenLet)])
                  >-> rmDeadcode >-> letTL
+    splitArgs  = topdownR (apply "separateArguments" separateArguments) !->
+                 topdownR (apply "caseCon" caseCon)
 
 
 constantPropagation :: NormRewrite
@@ -58,7 +63,9 @@ constantPropagation = inlineAndPropagate >->
     spec               = bottomupR (applyMany specTransformations)
     caseFlattening     = repeatR (topdownR (apply "caseFlat" caseFlat))
     dec                = repeatR (topdownR (apply "DEC" disjointExpressionConsolidation))
-    conSpec            = bottomupR (apply "constantSpec" constantSpec)
+    conSpec            = bottomupR  ((apply "appPropCS" appPropFast !->
+                                     bottomupR (apply "constantSpec" constantSpec)) >-!
+                                     apply "constantSpec" constantSpec)
 
     transPropagateAndInline :: [(String,NormRewrite)]
     transPropagateAndInline =

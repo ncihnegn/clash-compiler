@@ -77,6 +77,8 @@ module Clash.Sized.Internal.Index
   )
 where
 
+import Prelude hiding             (even, odd)
+
 import Control.DeepSeq            (NFData (..))
 import Data.Bits                  (Bits (..), FiniteBits (..))
 import Data.Data                  (Data)
@@ -88,7 +90,7 @@ import Language.Haskell.TH.Syntax (Lift(..))
 import Numeric.Natural            (Natural)
 import GHC.Generics               (Generic)
 import GHC.Stack                  (HasCallStack)
-import GHC.TypeLits               (CmpNat, KnownNat, Nat, type (+), type (-),
+import GHC.TypeLits               (KnownNat, Nat, type (+), type (-),
                                    type (*), type (<=), natVal)
 import GHC.TypeLits.Extra         (CLog)
 import Test.QuickCheck.Arbitrary  (Arbitrary (..), CoArbitrary (..),
@@ -98,6 +100,7 @@ import Test.QuickCheck.Arbitrary  (Arbitrary (..), CoArbitrary (..),
 import Clash.Class.BitPack        (BitPack (..), packXWith)
 import Clash.Class.Num            (ExtendingNum (..), SaturatingNum (..),
                                    SaturationMode (..))
+import Clash.Class.Parity         (Parity (..))
 import Clash.Class.Resize         (Resize (..))
 import Clash.Prelude.BitIndex     (replaceBit)
 import {-# SOURCE #-} Clash.Sized.Internal.BitVector (BitVector (BV), high, low, undefError)
@@ -151,7 +154,7 @@ instance (KnownNat n, 1 <= n) => BitPack (Index n) where
   unpack = unpack#
 
 -- | Safely convert an `SNat` value to an `Index`
-fromSNat :: (KnownNat m, CmpNat n m ~ 'LT) => SNat n -> Index m
+fromSNat :: (KnownNat m, n <= m + 1) => SNat n -> Index m
 fromSNat = snatToNum
 
 {-# NOINLINE pack# #-}
@@ -280,7 +283,7 @@ times# (I a) (I b) = I (a * b)
 
 instance (KnownNat n, 1 <= n) => SaturatingNum (Index n) where
   satAdd SatWrap !a !b =
-    case snatToNum @Int (SNat @n) of
+    case snatToNum @Integer (SNat @n) of
       1 -> fromInteger# 0
       _ -> leToPlusKN @1 @n $
         case plus# a b of
@@ -311,7 +314,7 @@ instance (KnownNat n, 1 <= n) => SaturatingNum (Index n) where
        else a -# b
 
   satMul SatWrap !a !b =
-    case snatToNum @Int (SNat @n) of
+    case snatToNum @Integer (SNat @n) of
       1 -> fromInteger# 0
       _ -> leToPlusKN @1 @n $
         case times# a b of
@@ -351,6 +354,10 @@ quot#,rem# :: Index n -> Index n -> Index n
 {-# NOINLINE toInteger# #-}
 toInteger# :: Index n -> Integer
 toInteger# (I n) = n
+
+instance (KnownNat n, 1 <= n) => Parity (Index n) where
+  even = even . pack
+  odd = odd . pack
 
 instance (KnownNat n, 1 <= n) => Bits (Index n) where
   a .&. b           = unpack# $ BV.and# (pack# a) (pack# b)

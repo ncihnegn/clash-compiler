@@ -28,6 +28,7 @@ import           Control.Lens            ((.=),(%=))
 import qualified Control.Lens            as Lens
 import           Control.Monad           (unless, when, zipWithM, join)
 import           Control.Monad.Reader    (ask, local)
+import qualified Control.Monad.State as State
 import           Control.Monad.State.Strict
   (State, evalState, get, modify, runState)
 import           Control.Monad.Trans.Except
@@ -36,7 +37,7 @@ import           Data.Either             (partitionEithers)
 import           Data.HashMap.Strict     (HashMap)
 import qualified Data.HashMap.Strict     as HashMap
 import           Data.String             (fromString)
-import           Data.List               (intersperse, unzip4, sort, intercalate)
+import           Data.List               (intersperse, unzip4, intercalate)
 import qualified Data.List               as List
 import           Data.Maybe              (catMaybes,fromMaybe,isNothing)
 import           Data.Monoid             (First (..))
@@ -46,6 +47,7 @@ import           Data.Semigroup          ((<>))
 #endif
 import           Data.Text               (Text)
 import qualified Data.Text               as Text
+import           Data.Text.Lazy          (toStrict)
 import           Data.Text.Prettyprint.Doc (Doc)
 
 import           Outputable              (ppr, showSDocUnsafe)
@@ -53,7 +55,8 @@ import           Outputable              (ppr, showSDocUnsafe)
 import           Clash.Annotations.BitRepresentation.ClashLib
   (coreToType')
 import           Clash.Annotations.BitRepresentation.Internal
-  (CustomReprs, ConstrRepr'(..), DataRepr'(..), getDataRepr, getConstrRepr)
+  (CustomReprs, ConstrRepr'(..), DataRepr'(..), getDataRepr,
+   uncheckedGetConstrRepr)
 import           Clash.Annotations.TopEntity (PortName (..), TopEntity (..))
 import           Clash.Driver.Types      (Manifest (..), ClashOpts (..))
 import           Clash.Core.DataCon      (DataCon (..))
@@ -66,19 +69,23 @@ import           Clash.Core.Subst
   (Subst (..), extendIdSubst, extendIdSubstList, extendInScopeId,
    extendInScopeIdList, mkSubst, substTm)
 import           Clash.Core.Term
-  (Alt, LetBinding, Pat (..), Term (..), TickInfo (..), NameMod (..))
+  (Alt, LetBinding, Pat (..), Term (..), TickInfo (..), NameMod (..),
+   collectArgsTicks, collectTicks)
 import           Clash.Core.TyCon
   (TyConName, TyConMap, tyConDataCons)
 import           Clash.Core.Type         (Type (..), TypeView (..),
                                           coreView1, splitTyConAppM, tyView, TyVar)
 import           Clash.Core.Util
-  (collectBndrs, stripTicks, substArgTys, termType, tySym)
+  (collectBndrs, stripTicks, substArgTys, termType, tyLitShow, mkTicks)
 import           Clash.Core.Var
   (Id, Var (..), mkLocalId, modifyVarName, Attr')
 import           Clash.Core.VarEnv
   (InScopeSet, extendInScopeSetList, uniqAway)
+import {-# SOURCE #-} Clash.Netlist.BlackBox
+import {-# SOURCE #-} Clash.Netlist.BlackBox.Util
 import           Clash.Netlist.Id        (IdType (..), stripDollarPrefixes)
 import           Clash.Netlist.Types     as HW
+import           Clash.Primitives.Types
 import           Clash.Unique
 import           Clash.Util
 
@@ -90,6 +97,10 @@ stripFiltered (FilteredHWType hwty _filtered) = hwty
 flattenFiltered :: FilteredHWType -> [[Bool]]
 flattenFiltered (FilteredHWType _hwty filtered) = map (map fst) filtered
 
+isVoidMaybe :: Bool -> Maybe HWType -> Bool
+isVoidMaybe dflt Nothing = dflt
+isVoidMaybe _dflt (Just t) = isVoid t
+
 -- | Determines if type is a zero-width construct ("void")
 isVoid :: HWType -> Bool
 isVoid Void {} = True
@@ -98,12 +109,6 @@ isVoid _       = False
 -- | Same as @isVoid@, but on @FilteredHWType@ instead of @HWType@
 isFilteredVoid :: FilteredHWType -> Bool
 isFilteredVoid = isVoid . stripFiltered
-
-isBiSignalOut :: HWType -> Bool
-isBiSignalOut (Void (Just (BiDirectional Out _))) = True
-isBiSignalOut (Vector n ty) | n /= 0              = isBiSignalOut ty
-isBiSignalOut (RTree _ ty)                        = isBiSignalOut ty
-isBiSignalOut _                                   = False
 
 mkIdentifier :: IdType -> Identifier -> NetlistMonad Identifier
 mkIdentifier typ nm = Lens.use mkIdentifierFn <*> pure typ <*> pure nm
@@ -124,9 +129,9 @@ splitNormalized
   -> Term
   -> (Either String ([Id],[LetBinding],Id))
 splitNormalized tcm expr = case collectBndrs expr of
-  (args,Letrec xes e)
+  (args, collectTicks -> (Letrec xes e, ticks))
     | (tmArgs,[]) <- partitionEithers args -> case stripTicks e of
-        Var v -> Right (tmArgs,xes,v)
+        Var v -> Right (tmArgs, fmap (second (`mkTicks` ticks)) xes,v)
         _     -> Left ($(curLoc) ++ "Not in normal form: res not simple var")
     | otherwise -> Left ($(curLoc) ++ "Not in normal form: tyArgs")
   _ ->
@@ -163,7 +168,7 @@ unsafeCoreTypeToHWType
   -> State HWMap FilteredHWType
 unsafeCoreTypeToHWType sp loc builtInTranslation reprs m ty =
   either (\msg -> throw (ClashException sp (loc ++ msg) Nothing)) id <$>
-  coreTypeToHWType builtInTranslation reprs m ty
+    coreTypeToHWType builtInTranslation reprs m ty
 
 -- | Same as @unsafeCoreTypeToHWTypeM@, but discards void filter information
 unsafeCoreTypeToHWTypeM'
@@ -211,83 +216,102 @@ coreTypeToHWTypeM ty = do
   htyCache Lens..= htm1
   return (hush hty)
 
-packSP
-  :: CustomReprs
-  -> (Text, c)
-  -> (ConstrRepr', Text, c)
-packSP reprs (name, tys) =
-  case getConstrRepr name reprs of
-    Just repr -> (repr, name, tys)
-    Nothing   -> error $ $(curLoc) ++ unwords
-      [ "Could not find custom representation for", Text.unpack name ]
+-- | Constructs error message for unexpected projections out of a type annotated
+-- with a custom bit representation.
+unexpectedProjectionErrorMsg
+  :: DataRepr'
+  -> Int
+  -- ^ Constructor index
+  -> Int
+  -- ^ Field index
+  -> String
+unexpectedProjectionErrorMsg dataRepr cI fI =
+     "Unexpected projection of zero-width type: " ++ show (drType dataRepr)
+  ++ ". Tried to make a projection of field " ++ show fI ++ " of "
+  ++ constrNm ++ ". Did you try to project a field marked as zero-width"
+  ++ " by a custom bit representation annotation?"
+ where
+   constrNm = show (crName (drConstrs dataRepr !! cI))
 
-packSum
-  :: CustomReprs
-  -> Text
-  -> (ConstrRepr', Text)
-packSum reprs name =
-  case getConstrRepr name reprs of
-    Just repr -> (repr, name)
-    Nothing   -> error $ $(curLoc) ++ unwords
-      [ "Could not find custom representation for", Text.unpack name ]
+-- | Helper function of 'maybeConvertToCustomRepr'
+convertToCustomRepr
+  :: HasCallStack
+  => CustomReprs
+  -> DataRepr'
+  -> HWType
+  -> HWType
+convertToCustomRepr reprs dRepr@(DataRepr' name' size constrs) hwTy =
+  if length constrs == nConstrs then
+    if size <= 0 then
+      Void (Just cs)
+    else
+      cs
+  else
+    error (unwords
+      [ "Type", show name', "has", show nConstrs, "constructor(s), "
+      , "but the custom bit representation only specified", show (length constrs)
+      , "constructors."
+      ])
+ where
+  cs = insertVoids $ case hwTy of
+    Sum name conIds ->
+      CustomSum name dRepr size (map packSum conIds)
+    SP name conIdsAndFieldTys ->
+      CustomSP name dRepr size (map packSP conIdsAndFieldTys)
+    Product name maybeFieldNames fieldTys
+      | [ConstrRepr' _cName _pos _mask _val fieldAnns] <- constrs ->
+      CustomProduct name dRepr size maybeFieldNames (zip fieldAnns fieldTys)
+    _ ->
+      error
+        ( "Found a custom bit representation annotation " ++ show dRepr ++ ", "
+       ++ "but it was applied to an unsupported HWType: " ++ show hwTy ++ ".")
 
-fixCustomRepr
+  nConstrs :: Int
+  nConstrs = case hwTy of
+    (Sum _name conIds) -> length conIds
+    (SP _name conIdsAndFieldTys) -> length conIdsAndFieldTys
+    (Product {}) -> 1
+    _ -> error ("Unexpected HWType: " ++ show hwTy)
+
+  packSP (name, tys) = (uncheckedGetConstrRepr name reprs, name, tys)
+  packSum name = (uncheckedGetConstrRepr name reprs, name)
+
+  -- Replace some "hwTy" with "Void (Just hwTy)" if the custom bit
+  -- representation indicated that field is represented by zero bits. We can't
+  -- simply remove them, as we'll later have to deal with an "overapplied"
+  -- constructor. If we remove the arguments altogether, we wouldn't know which
+  -- - on their own potentially non-void! - arguments to ignore.
+  insertVoids :: HWType -> HWType
+  insertVoids (CustomSP i d s constrs0) =
+    CustomSP i d s (map go0 constrs0)
+   where
+    go0 (con@(ConstrRepr' _ _ _ _ fieldAnns), i0, hwTys) =
+      (con, i0, zipWith go1 fieldAnns hwTys)
+    go1 0 hwTy0 = Void (Just hwTy0)
+    go1 _ hwTy0 = hwTy0
+  insertVoids (CustomProduct i d s f fieldAnns) =
+    CustomProduct i d s f (map go fieldAnns)
+   where
+    go (0, hwTy0) = (0, Void (Just hwTy0))
+    go (n, hwTy0) = (n, hwTy0)
+  insertVoids hwTy0 = hwTy0
+
+-- | Given a map containing custom bit representation, a type, and the same
+-- type represented as HWType, convert the HWType to a CustomSP/CustomSum if
+-- it has a custom bit representation.
+maybeConvertToCustomRepr
   :: CustomReprs
+  -- ^ Map containing all custom representations index on its type
   -> Type
+  -- ^ Custom reprs are index on type, so we need the clash core type to look
+  -- it up.
   -> HWType
+  -- ^ Type of previous argument represented as a HWType
   -> HWType
-fixCustomRepr reprs (coreToType' -> Right tyName) sum_@(Sum name subtys) =
-  case getDataRepr tyName reprs of
-    Just dRepr@(DataRepr' name' size constrs) ->
-      if length constrs == length subtys then
-        CustomSum
-          name
-          dRepr
-          (fromIntegral size)
-          [packSum reprs ty | ty <- subtys]
-      else
-        error $ $(curLoc) ++ (Text.unpack $ Text.unwords
-          [ "Type "
-          , Text.pack $ show name'
-          , "has"
-          , Text.pack $ show $ length subtys
-          , "constructors: \n\n"
-          , Text.intercalate "\n" $ sort [Text.append " * " id_ | id_ <- subtys]
-          , "\n\nBut the custom bit representation only specified"
-          , Text.pack $ show $ length constrs
-          , "constructors:\n\n"
-          , Text.intercalate "\n" $ sort [Text.append " * " id_ | (ConstrRepr' id_ _ _ _ _) <- constrs]
-          ])
-    Nothing ->
-      -- No custom representation found
-      sum_
-
-fixCustomRepr reprs (coreToType' -> Right tyName) sp@(SP name subtys) =
-  case getDataRepr tyName reprs of
-    Just dRepr@(DataRepr' name' size constrs) ->
-      if length constrs == length subtys then
-        CustomSP
-          name
-          dRepr
-          (fromIntegral size)
-          [packSP reprs ty | ty <- subtys]
-      else
-        error $ $(curLoc) ++ (Text.unpack $ Text.unwords
-          [ "Type "
-          , Text.pack $ show $ name'
-          , "has"
-          , Text.pack $ show $ length subtys
-          , "constructors: \n\n"
-          , Text.intercalate "\n" $ sort [Text.append " * " id_ | (id_, _) <- subtys]
-          , "\n\nBut the custom bit representation only specified"
-          , Text.pack $ show $ length constrs, "constructors:\n\n"
-          , Text.intercalate "\n" $ sort [Text.append " * " id_ | (ConstrRepr' id_ _ _ _ _) <- constrs]
-          ])
-    Nothing ->
-      -- No custom representation found
-      sp
-
-fixCustomRepr _ _ typ = typ
+maybeConvertToCustomRepr reprs (coreToType' -> Right tyName) hwTy
+  | Just dRepr <- getDataRepr tyName reprs =
+    convertToCustomRepr reprs dRepr hwTy
+maybeConvertToCustomRepr _reprs _ty hwTy = hwTy
 
 -- | Same as @coreTypeToHWType@, but discards void filter information
 coreTypeToHWType'
@@ -330,14 +354,14 @@ coreTypeToHWType builtInTranslation reprs m ty = do
               (Either String FilteredHWType)
   go (Just hwtyE) _ = pure $
     (\(FilteredHWType hwty filtered) ->
-      (FilteredHWType (fixCustomRepr reprs ty hwty) filtered)) <$> hwtyE
+      (FilteredHWType (maybeConvertToCustomRepr reprs ty hwty) filtered)) <$> hwtyE
   -- Strip transparant types:
   go _ (coreView1 m -> Just ty') =
     coreTypeToHWType builtInTranslation reprs m ty'
   -- Try to create hwtype based on AST:
   go _ (tyView -> TyConApp tc args) = runExceptT $ do
     FilteredHWType hwty filtered <- mkADT builtInTranslation reprs m (showPpr ty) tc args
-    return (FilteredHWType (fixCustomRepr reprs ty hwty) filtered)
+    return (FilteredHWType (maybeConvertToCustomRepr reprs ty hwty) filtered)
   -- All methods failed:
   go _ _ = return $ Left $ "Can't translate non-tycon type: " ++ showPpr ty
 
@@ -512,6 +536,7 @@ typeSize (BiDirectional In h) = typeSize h
 typeSize (BiDirectional Out _) = 0
 typeSize (CustomSP _ _ size _) = fromIntegral size
 typeSize (CustomSum _ _ size _) = fromIntegral size
+typeSize (CustomProduct _ _ size _ _) = fromIntegral size
 typeSize (Annotated _ ty) = typeSize ty
 
 -- | Determines the bitsize of the constructor of a type
@@ -665,9 +690,9 @@ mkUniqueNormalized is0 topMM (args,binds,res) = do
           return (varName res3,substRes'
                  ,[(res1, Var res3)])
       -- Replace occurences of "<X>" by "<X>_rec"
-      let resN    = varName res
-          bndrs'  = map (\i -> if varName i == resN then modifyVarName (const res2) i else i) bndrs
-          (bndrsL,r:bndrsR) = break ((== res2).varName) bndrs'
+      let resN = varName res
+      bndrs' <- mapM (setBinderName resN res2) binds
+      let (bndrsL,r:bndrsR) = break ((== res2).varName) bndrs'
       -- Make let-binders unique
       (bndrsL',substL) <- mkUnique subst'' bndrsL
       (bndrsR',substR) <- mkUnique substL  bndrsR
@@ -678,6 +703,43 @@ mkUniqueNormalized is0 topMM (args,binds,res) = do
     Nothing -> do
       (bndrs', substArgs') <- mkUnique substArgs bndrs
       return (wereVoids,iports,iwrappers,[],[],zip bndrs' (map (substTm ("mkUniqueNormalized2" :: Doc ()) substArgs') exprs),Nothing)
+
+-- | Set the name of the binder
+--
+-- Normally, it just keeps the existing name, but there are two exceptions:
+--
+-- 1. The binding is recursive, and also the return value; in this case it's
+--    suffixed with `_rec`
+-- 2. The binding binds a primitive that has a name control field
+setBinderName
+  :: Name Term
+  -- ^ The name of the binding that's recursive and is also the result the
+  -- return value
+  -> Name Term
+  -- ^ The above mentioned name suffixed by "_rec"
+  -> (Id,Term)
+  -- ^ The binding
+  -> NetlistMonad Id
+setBinderName resN res2 (i,collectArgsTicks -> (k,args,ticks)) = case k of
+  Prim nm _ -> extractPrimWarnOrFail nm >>= go nm
+  _ -> return goDef
+ where
+  go nm (BlackBox {resultName = Just (BBTemplate nmD)}) = withTicks ticks $ \_ -> do
+    (bbCtx,_) <- preserveVarEnv (mkBlackBoxContext nm goDef args)
+    be <- Lens.use backend
+    let q = case be of
+              SomeBackend s -> toStrict ((State.evalState (renderTemplate bbCtx nmD) s) 0)
+    if nameOcc (varName i) == q
+       then return goDef
+       else if varName i == resN
+            then return (modifyVarName (\_ -> res2 {nameOcc = q}) i)
+            else return (modifyVarName (\n -> n {nameOcc = q}) i)
+
+  go _ _ = return goDef
+
+  goDef = if varName i == resN
+             then modifyVarName (const res2) i
+             else i
 
 mkUniqueArguments
   :: Subst
@@ -851,9 +913,22 @@ mkUniqueIdentifier typ nm = do
         seenIds %= HashMap.insert i' 0
         return i'
 
--- | Preserve the Netlist '_varCount','_curCompNm','_seenIds' when executing a monadic action
-preserveVarEnv :: NetlistMonad a
-               -> NetlistMonad a
+-- | Preserve the complete state before running an action, and restore it
+-- afterwards.
+preserveState
+  :: NetlistMonad a
+  -> NetlistMonad a
+preserveState action = do
+  state <- State.get
+  val <- action
+  State.put state
+  pure val
+
+-- | Preserve the Netlist '_varCount','_curCompNm','_seenIds' when executing
+-- a monadic action
+preserveVarEnv
+  :: NetlistMonad a
+  -> NetlistMonad a
 preserveVarEnv action = do
   -- store state
   vCnt  <- Lens.use varCount
@@ -1292,28 +1367,29 @@ mkTopUnWrapper topEntity annM man dstId args tickDecls = do
   let iResult = inpAssigns ++ concat wrappers
       result = ("result",snd dstId)
 
-  topOutputM <- mkTopOutput
-                  topM
-                  (zip outNames outTys)
-                  (head oPortSupply)
-                  result
+  instLabel0 <- extendIdentifier Basic topName ("_" `Text.append` fst dstId)
+  instLabel1 <- fromMaybe instLabel0 <$> Lens.view setName
+  instLabel2 <- affixName instLabel1
+  instLabel3 <- mkUniqueIdentifier Basic instLabel2
+  topOutputM <- mkTopOutput topM (zip outNames outTys) (head oPortSupply) result
 
-  (iResult ++) <$> case topOutputM of
-    Nothing -> return []
+  let
+    topCompDecl oports =
+      InstDecl
+        Entity
+        (Just topName)
+        topName
+        instLabel3
+        []
+        ( map (\(p,i,t) -> (Identifier p Nothing,In, t,Identifier i Nothing)) (concat iports) ++
+          map (\(p,o,t) -> (Identifier p Nothing,Out,t,Identifier o Nothing)) oports)
+
+  case topOutputM of
+    Nothing ->
+      pure (topCompDecl [] : iResult)
     Just (_, (oports, unwrappers, idsO)) -> do
-        instLabel0 <- extendIdentifier Basic topName ("_" `Text.append` fst dstId)
-        instLabel1 <- mkUniqueIdentifier Basic instLabel0
         let outpAssign = Assignment (fst dstId) (resBV topM idsO)
-        let topCompDecl = InstDecl
-                            Entity
-                            (Just topName)
-                            topName
-                            instLabel1
-                            []
-                            ( map (\(p,i,t) -> (Identifier p Nothing,In, t,Identifier i Nothing)) (concat iports) ++
-                              map (\(p,o,t) -> (Identifier p Nothing,Out,t,Identifier o Nothing)) oports)
-
-        return $ tickDecls ++ (topCompDecl:unwrappers) ++ [outpAssign]
+        pure (iResult ++ tickDecls ++ (topCompDecl oports:unwrappers) ++ [outpAssign])
 
 -- | Convert between BitVector for an argument
 argBV
@@ -1439,7 +1515,7 @@ mkTopInput topM inps pM = case pM of
     go' (PortName _) ((iN,iTy):inps') (_,hwty) = do
       iN' <- mkUniqueIdentifier Extended iN
       return (inps',([(iN,iN',hwty)]
-                    ,[NetDecl' Nothing Wire iN' (Left iTy)]
+                    ,[NetDecl' Nothing Wire iN' (Left iTy) Nothing]
                     ,Right (iN',hwty)))
 
     go' (PortName _) [] _ = error "This shouldnt happen"
@@ -1630,7 +1706,7 @@ mkTopOutput' topM outps pM = case pM of
     go' (PortName _) ((oN,oTy):outps') (_,hwty) = do
       oN' <- mkUniqueIdentifier Extended oN
       return (outps',([(oN,oN',hwty)]
-                     ,[NetDecl' Nothing Wire oN' (Left oTy)]
+                     ,[NetDecl' Nothing Wire oN' (Left oTy) Nothing]
                      ,Right (oN',hwty)))
 
     go' (PortName _) [] _ = error "This shouldnt happen"
@@ -1807,12 +1883,14 @@ withTicks ticks0 k = do
  where
   go decls [] = k (reverse decls)
 
+  go decls (NoDeDup:ticks) = go decls ticks
+
   go decls (SrcSpan sp:ticks) =
     go (TickDecl (Text.pack (showSDocUnsafe (ppr sp))):decls) ticks
 
   go decls (NameMod m nm0:ticks) = do
     tcm <- Lens.use tcCache
-    case runExcept (tySym tcm nm0) of
+    case runExcept (tyLitShow tcm nm0) of
       Right nm1 -> local (modName m nm1) (go decls ticks)
       _ -> go decls ticks
 
@@ -1822,6 +1900,9 @@ withTicks ticks0 k = do
   modName SuffixName (Text.pack -> s2) env@(NetlistEnv {_suffixName = s1})
     | Text.null s1 = env {_suffixName = s2}
     | otherwise    = env {_suffixName = s2 <> "_" <> s1}
+  modName SuffixNameP (Text.pack -> s2) env@(NetlistEnv {_suffixName = s1})
+    | Text.null s1 = env {_suffixName = s2}
+    | otherwise    = env {_suffixName = s1 <> "_" <> s2}
   modName SetName (Text.pack -> s) env = env {_setName = Just s}
 
 -- | Add the pre- and suffix names in the current environment to the given

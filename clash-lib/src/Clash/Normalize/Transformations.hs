@@ -57,6 +57,8 @@ module Clash.Normalize.Transformations
   , argCastSpec
   , etaExpandSyn
   , appPropFast
+  , separateArguments
+  , xOptimize
   )
 where
 
@@ -69,7 +71,6 @@ import           Control.Monad.State         (StateT (..), modify)
 import           Control.Monad.State.Strict  (evalState)
 import           Control.Monad.Writer        (lift, listen)
 import           Control.Monad.Trans.Except  (runExcept)
-import           Data.Bits                   ((.&.), complement)
 import           Data.Coerce                 (coerce)
 import qualified Data.Either                 as Either
 import qualified Data.HashMap.Lazy           as HashMap
@@ -80,7 +81,7 @@ import qualified Data.Monoid                 as Monoid
 import qualified Data.Primitive.ByteArray    as BA
 import qualified Data.Text                   as Text
 import qualified Data.Vector.Primitive       as PV
-import           Debug.Trace                 (trace)
+import           Debug.Trace
 import           GHC.Integer.GMP.Internals   (Integer (..), BigNat (..))
 
 import           BasicTypes                  (InlineSpec (..))
@@ -89,7 +90,7 @@ import           Clash.Annotations.Primitive (extractPrim)
 import           Clash.Core.DataCon          (DataCon (..))
 import           Clash.Core.Evaluator        (PureHeap, whnf')
 import           Clash.Core.Name
-  (Name (..), NameSort (..), mkUnsafeSystemName)
+  (Name (..), NameSort (..), mkUnsafeSystemName, nameOcc)
 import           Clash.Core.FreeVars
   (localIdOccursIn, localIdsDoNotOccurIn, freeLocalIds, termFreeTyVars, typeFreeVars, localVarsDoNotOccurIn)
 import           Clash.Core.Literal          (Literal (..))
@@ -98,30 +99,34 @@ import           Clash.Core.Subst
   (substTm, mkSubst, extendIdSubst, extendIdSubstList, extendTvSubst,
    extendTvSubstList, freshenTm, substTyInVar, deShadowTerm)
 import           Clash.Core.Term
-  (LetBinding, Pat (..), Term (..), CoreContext (..), PrimInfo (..), TickInfo,
-   isLambdaBodyCtx, isTickCtx, collectArgs, collectArgsTicks, collectTicks,
-   partitionTicks)
+  ( LetBinding, Pat (..), Term (..), CoreContext (..), PrimInfo (..)
+  , TickInfo(..) , WorkInfo(WorkConstant), Alt, TickInfo
+  , isLambdaBodyCtx, isTickCtx, collectArgs
+  , collectArgsTicks, collectTicks , partitionTicks
+  )
 import           Clash.Core.Type             (Type, TypeView (..), applyFunTy,
                                               isPolyFunCoreTy, isClassTy,
                                               normalizeType, splitFunForallTy,
                                               splitFunTy,
-                                              tyView)
+                                              tyView, mkPolyFunTy)
 import           Clash.Core.TyCon            (TyConMap, tyConDataCons)
 import           Clash.Core.Util
   (isCon, isFun, isLet, isPolyFun, isPrim,
    isSignalType, isVar, mkApps, mkLams, mkVec, piResultTy, termSize, termType,
    tyNatSize, patVars, isAbsurdAlt, altEqs, substInExistentialsList,
-   solveNonAbsurds, patIds, isLocalVar, undefinedTm, stripTicks, mkTicks)
+   solveNonAbsurds, patIds, isLocalVar, undefinedTm, stripTicks, mkTicks,
+   shouldSplit)
 import           Clash.Core.Var
-  (Id, Var (..), isGlobalId, isLocalId, mkLocalId)
+  (Id, TyVar, Var (..), isGlobalId, isLocalId, mkLocalId)
 import           Clash.Core.VarEnv
   (InScopeSet, VarEnv, VarSet, elemVarSet,
    emptyVarEnv, emptyVarSet, extendInScopeSet, extendInScopeSetList, lookupVarEnv,
    notElemVarSet, unionVarEnvWith, unionVarSet, unionInScope, unitVarEnv,
    unitVarSet, mkVarSet, mkInScopeSet, uniqAway)
 import           Clash.Driver.Types          (DebugLevel (..))
+import           Clash.Netlist.BlackBox.Types (Element(Err))
 import           Clash.Netlist.BlackBox.Util (usedArguments)
-import           Clash.Netlist.Types         (HWType (..), FilteredHWType(..))
+import           Clash.Netlist.Types         (BlackBox(..), HWType (..), FilteredHWType(..))
 import           Clash.Netlist.Util
   (coreTypeToHWType, representableType, splitNormalized, bindsExistentials)
 import           Clash.Normalize.DEC
@@ -374,18 +379,18 @@ inlineNonRep (TransformContext localScope _) e@(Case scrut altsTy alts)
     let scrutTy = termType tcm scrut
         noException = not (exception tcm scrutTy)
     if noException && (Maybe.fromMaybe 0 isInlined) > limit
-      then do
-        traceIf True (concat [$(curLoc) ++ "InlineNonRep: " ++ showPpr (varName f)
-                             ," already inlined " ++ show limit ++ " times in:"
-                             , showPpr (varName cf)
-                             , "\nType of the subject is: " ++ showPpr scrutTy
-                             , "\nFunction " ++ showPpr (varName cf)
-                             , " will not reach a normal form, and compilation"
-                             , " might fail."
-                             , "\nRun with '-fclash-inline-limit=N' to increase"
-                             , " the inlining limit to N."
-                             ])
-                     (return e)
+      then
+        trace (concat [ $(curLoc) ++ "InlineNonRep: " ++ showPpr (varName f)
+                      ," already inlined " ++ show limit ++ " times in:"
+                      , showPpr (varName cf)
+                      , "\nType of the subject is: " ++ showPpr scrutTy
+                      , "\nFunction " ++ showPpr (varName cf)
+                      , " will not reach a normal form, and compilation"
+                      , " might fail."
+                      , "\nRun with '-fclash-inline-limit=N' to increase"
+                      , " the inlining limit to N."
+                      ])
+              (return e)
       else do
         bodyMaybe   <- lookupVarEnv f <$> Lens.use bindings
         nonRepScrut <- not <$> (representableType <$> Lens.view typeTranslator
@@ -396,9 +401,14 @@ inlineNonRep (TransformContext localScope _) e@(Case scrut altsTy alts)
         case (nonRepScrut, bodyMaybe) of
           (True,Just (_,_,_,scrutBody0)) -> do
             Monad.when noException (zoomExtra (addNewInline f cf))
+
             -- See Note [AppProp no-shadow invariant]
             let scrutBody1 = deShadowTerm localScope scrutBody0
-            changed $ Case (mkApps (mkTicks scrutBody1 ticks) args) altsTy alts
+            let scrutBody2 = mkTicks scrutBody1 (mkInlineTick f : ticks)
+            let scrutBody3 = mkApps scrutBody2 args
+
+            changed $ Case scrutBody3 altsTy alts
+
           _ -> return e
   where
     exception = isClassTy
@@ -447,10 +457,13 @@ caseCon (TransformContext is0 _) (Case scrut ty alts)
                   [] -> e
                   _  ->
                     -- See Note [CaseCon deshadow]
-                    let ((is3,substIds),binds') = List.mapAccumL newBinder
-                                                    (is1,[]) binds
+                    let ((is3,substIds),binds1) =
+                          List.mapAccumL newBinder (is1,[]) binds
                         subst = extendIdSubstList (mkSubst is3) substIds
-                    in  Letrec binds' (substTm "caseCon0" subst e)
+                        body  = substTm "caseCon0" subst e
+                    in  case Maybe.catMaybes binds1 of
+                          []     -> body
+                          binds2 -> Letrec binds2 body
         let subst = extendTvSubstList (mkSubst is1)
                   $ zip tvs (drop (length (dcUnivTyVars dc)) (Either.rights args))
         changed (substTm "caseCon1" subst e')
@@ -461,10 +474,13 @@ caseCon (TransformContext is0 _) (Case scrut ty alts)
     equalCon dc (DataPat dc' _ _) = dcTag dc == dcTag dc'
     equalCon _  _                 = False
 
-    newBinder (isN0,substN) (x,arg) =
-      let x'   = uniqAway isN0 x
-          isN1 = extendInScopeSet isN0 x'
-      in  ((isN1,(x,Var x'):substN),(x',arg))
+    newBinder (isN0,substN) (x,arg)
+      | isWorkFree arg
+      = ((isN0,(x,arg):substN),Nothing)
+      | otherwise
+      = let x'   = uniqAway isN0 x
+            isN1 = extendInScopeSet isN0 x'
+        in  ((isN1,(x,Var x'):substN),Just (x',arg))
 
 caseCon _ c@(Case (stripTicks -> Literal l) _ alts) = case List.find (equalLit . fst) alts of
     Just (LitPat _,e) -> changed e
@@ -697,7 +713,7 @@ nonRepANF _ e = return e
 -- the body is a variable-reference.
 topLet :: HasCallStack => NormRewrite
 topLet (TransformContext is0 ctx) e
-  | all (\c -> isLambdaBodyCtx c || isTickCtx c) ctx && not (isLet e)
+  | all (\c -> isLambdaBodyCtx c || isTickCtx c) ctx && not (isLet e) && not (isTick e)
   = do
   untranslatable <- isUntranslatable False e
   if untranslatable
@@ -705,6 +721,9 @@ topLet (TransformContext is0 ctx) e
     else do tcm <- Lens.view tcCache
             argId <- mkTmBinderFor is0 tcm (mkUnsafeSystemName "result" 0) e
             changed (Letrec [(argId, e)] (Var argId))
+ where
+  isTick Tick{} = True
+  isTick _ = False
 
 topLet (TransformContext is0 ctx) e@(Letrec binds body)
   | all (\c -> isLambdaBodyCtx c || isTickCtx c) ctx
@@ -752,14 +771,18 @@ removeUnusedExpr :: HasCallStack => NormRewrite
 removeUnusedExpr _ e@(collectArgsTicks -> (p@(Prim nm pInfo),args,ticks)) = do
   bbM <- HashMap.lookup nm <$> Lens.use (extra.primitives)
   case bbM of
-    Just (extractPrim ->  Just (BlackBox pNm _ _ _ _ _ _ inc templ)) -> do
+    Just (extractPrim ->  Just (BlackBox pNm _ _ _ _ _ _ _ _ inc r ri templ)) -> do
       let usedArgs | isFromInt pNm
                    = [0,1,2]
                    | nm `elem` ["Clash.Annotations.BitRepresentation.Deriving.dontApplyInHDL"
                                ]
                    = [0,1]
                    | otherwise
-                   = usedArguments templ ++ concatMap (usedArguments . snd) inc
+                   = concat [ maybe [] usedArguments r
+                            , maybe [] usedArguments ri
+                            , usedArguments templ
+                            , concatMap (usedArguments . snd) inc
+                            ]
       tcm <- Lens.view tcCache
       args' <- go tcm 0 usedArgs args
       if args == args'
@@ -813,7 +836,7 @@ bindConstantVar = inlineBinders test
   where
     test _ (_,stripTicks -> e) = case isLocalVar e of
       True -> return True
-      _    -> isConstantNotClockReset e >>= \case
+      _    -> isWorkFreeIsh e >>= \case
         True -> Lens.use (extra.inlineConstantLimit) >>= \case
           0 -> return True
           n -> return (termSize e <= n)
@@ -834,7 +857,7 @@ letCast _ (Cast (stripTicks -> Letrec binds body) ty1 ty2) =
 letCast _ e = return e
 
 
--- | Push cast over an argument to a funtion into that function
+-- | Push cast over an argument to a function into that function
 --
 -- This is done by specializing on the casted argument.
 -- Example:
@@ -847,20 +870,24 @@ letCast _ e = return e
 --   y = f' a
 --     where f' x' = (\x -> g x) (cast x')
 -- @
+--
+-- The reason d'etre for this transformation is that we hope to end up with
+-- and expression where two casts are "back-to-back" after which we can
+-- eliminate them in 'eliminateCastCast'.
 argCastSpec :: HasCallStack => NormRewrite
-argCastSpec ctx e@(App _ (stripTicks -> Cast e' _ _)) = case e' of
-  Var {} -> go
-  Cast (Var {}) _ _ -> go
-  _ -> warn go
-  where
-    go = specializeNorm ctx e
-    warn = trace (unlines ["WARNING: " ++ $(curLoc) ++ "specializing a function on a possibly non work-free cast."
-                          ,"Generated HDL implementation might contain duplicate work."
-                          ,"Please report this as a bug."
-                          ,""
-                          ,"Expression where this occurs:"
-                          ,showPpr e
-                          ])
+argCastSpec ctx e@(App _ (stripTicks -> Cast e' _ _)) =
+  if isWorkFree e' then
+    go
+  else
+    warn go
+ where
+  go = specializeNorm ctx e
+  warn = trace (unwords
+    [ "WARNING:", $(curLoc), "specializing a function on a non work-free"
+    , "cast. Generated HDL implementation might contain duplicate work."
+    , "Please report this as a bug.", "\n\nExpression where this occured:"
+    , "\n\n" ++ showPpr e
+    ])
 argCastSpec _ e = return e
 
 -- | Only inline casts that just contain a 'Var', because these are guaranteed work-free.
@@ -951,8 +978,11 @@ inlineWorkFree (TransformContext localScope _) e@(collectArgsTicks -> (Var f,arg
             if isRecBndr
                then return e
                else do
-                 -- See Note [AppProp no-shadow invariant]
-                 changed (mkApps (mkTicks (deShadowTerm localScope body) ticks) args)
+                 let tm0 = deShadowTerm localScope body
+                 let tm1 = mkTicks tm0 (mkInlineTick f : ticks)
+
+                 changed $ mkApps tm1 args
+
           _ -> return e
   where
     -- an expression is has work when it contains free local variables,
@@ -1008,8 +1038,13 @@ inlineSmall (TransformContext localScope _) e@(collectArgsTicks -> (Var f,args,t
           if not isRecBndr && inl /= NoInline && termSize body < sizeLimit
              then do
                -- See Note [AppProp no-shadow invariant]
-               changed (mkApps (mkTicks (deShadowTerm localScope body) ticks) args)
+               let tm0 = deShadowTerm localScope body
+               let tm1 = mkTicks tm0 (mkInlineTick f : ticks)
+
+               changed $ mkApps tm1 args
+
              else return e
+
         _ -> return e
 
 inlineSmall _ e = return e
@@ -1017,12 +1052,29 @@ inlineSmall _ e = return e
 -- | Specialise functions on arguments which are constant, except when they
 -- are clock, reset generators.
 constantSpec :: HasCallStack => NormRewrite
-constantSpec ctx e@(App e1 e2)
+constantSpec ctx@(TransformContext is0 tfCtx) e@(App e1 e2)
   | (Var {}, args) <- collectArgs e1
   , (_, []) <- Either.partitionEithers args
   , null $ Lens.toListOf termFreeTyVars e2
-  = do e2Speccable <- canConstantSpec e2
-       if e2Speccable then specializeNorm ctx e else return e
+  = do specInfo<- constantSpecInfo ctx e2
+       if csrFoundConstant specInfo then
+         let newBindings = csrNewBindings specInfo in
+         if null newBindings then
+           -- Whole of e2 is constant
+           specializeNorm ctx (App e1 e2)
+         else do
+           -- Parts of e2 are constant
+           let is1 = extendInScopeSetList is0 (fst <$> csrNewBindings specInfo)
+           -- Deshadow because appPropFast will be called after constantSpec
+           deShadowTerm is0
+            <$> Letrec newBindings
+            <$> specializeNorm
+                  (TransformContext is1 tfCtx)
+                  (App e1 (csrNewTerm specInfo))
+
+       else
+        -- e2 has no constant parts
+        return e
 constantSpec _ e = return e
 
 
@@ -1656,7 +1708,7 @@ recToLetRec (TransformContext is0 []) e = do
     -- corresponding (sub)field from the target variable.
     --
     -- TODO: See [Note: Breaks on constants and predetermined equality]
-    eqApp tcm v args (collectArgs -> (Var v',args'))
+    eqApp tcm v args (collectArgs . stripTicks -> (Var v',args'))
       | isGlobalId v'
       , v == v'
       , let args2 = Either.lefts args'
@@ -1664,9 +1716,9 @@ recToLetRec (TransformContext is0 []) e = do
       = and (zipWith (eqArg tcm) args args2)
     eqApp _ _ _ _ = False
 
-    eqArg _ v1 v2@(Var {})
+    eqArg _ v1 v2@(stripTicks -> Var {})
       = v1 == v2
-    eqArg tcm v1 v2@(collectArgs -> (Data _, args'))
+    eqArg tcm v1 v2@(collectArgs . stripTicks -> (Data _, args'))
       | let t1 = termType tcm v1
       , let t2 = termType tcm v2
       , t1 == t2
@@ -1699,7 +1751,7 @@ recToLetRec (TransformContext is0 []) e = do
     --     construction of `y` with `(fst x, fst x)`.
     --
     eqDat :: Term -> [Int] -> Term -> Bool
-    eqDat v fTrace (collectArgs -> (Data _, args)) =
+    eqDat v fTrace (collectArgs . stripTicks -> (Data _, args)) =
       and (zipWith (eqDat v) (map (:fTrace) [0..]) (Either.lefts args))
     eqDat v1 fTrace v2 =
       case stripProjection (reverse fTrace) v1 v2 of
@@ -1785,13 +1837,15 @@ reduceBinders
   -> ([LetBinding],Term)
 reduceBinders _  processed body [] = (processed,body)
 reduceBinders is processed body ((id_,expr):binders) = case List.find ((== expr) . snd) processed of
-    Just (id2,_) ->
+    Just (id2,_)
+      | (_,_,ticks) <- collectArgsTicks expr
+      , NoDeDup `notElem` ticks ->
       let subst      = extendIdSubst (mkSubst is) id_ (Var id2)
           processed' = map (second (substTm "reduceBinders.processed" subst)) processed
           binders'   = map (second (substTm "reduceBinders.binders"   subst)) binders
           body'      = substTm "reduceBinders.body" subst body
       in  reduceBinders is processed' body' binders'
-    Nothing -> reduceBinders is ((id_,expr):processed) body binders
+    _ -> reduceBinders is ((id_,expr):processed) body binders
 
 reduceConst :: HasCallStack => NormRewrite
 reduceConst ctx@(TransformContext is0 _) e@(App _ _)
@@ -1900,10 +1954,9 @@ reduceNonRepPrim c@(TransformContext is0 ctx) e@(App _ _) | (Prim nm _, args, ti
           _ -> return e
       "Clash.Sized.Vector.fold" | length args == 4 -> do
         let [aTy,nTy] = Either.rights args
-            isPow2 x  = x /= 0 && (x .&. (complement x + 1)) == x
         untranslatableTy <- isUntranslatableType_not_poly aTy
         case runExcept (tyNatSize tcm nTy) of
-          Right n | not (isPow2 (n + 1)) || untranslatableTy || shouldReduce1 || ultra || n == 0 ->
+          Right n | untranslatableTy || shouldReduce1 || ultra || n == 0 ->
             let [fun,arg] = Either.lefts args
             in  (`mkTicks` ticks) <$> reduceFold c (n + 1) aTy fun arg
           _ -> return e
@@ -2148,6 +2201,37 @@ disjointExpressionConsolidation ctx@(TransformContext is0 _) e@(Case _scrut _ty 
           nm'' = last (Text.splitOn "." nm) `Text.append` "Out"
       mkInternalVar isN nm'' ty
 
+    isInteresting 
+   :: VarEnv Int 
+   -> CompiledPrimMap 
+   -> VarSet 
+   -> (Id, Term) 
+   -> Bool 
+ isInteresting allOccs prims bodyFVs (id_,(fst.collectArgs) -> tm) 
+   | nameSort (varName id_) /= User 
+   , id_ `notElemVarSet` bodyFVs 
+   = case tm of 
+       Prim nm _ 
+         | Just (extractPrim -> Just p@(BlackBox {})) <- HashMap.lookup nm prims 
+         , TExpr <- kind p 
+         , Just occ <- lookupVarEnv id_ allOccs 
+         , occ < 2 
+         -> True 
+       Case _ _ [_] -> True 
+       Data _ -> True 
+       _ -> False 
+   | id_ `notElemVarSet` bodyFVs 
+   = case tm of 
+       Case _ _ [(DataPat dcE _ _,_)] 
+         -> let nm = (nameOcc (dcName dcE)) 
+            in -- Inlines WW projection that exposes internals of the BitVector types 
+               nm == "Clash.Sized.Internal.BitVector.BV"  || 
+               nm == "Clash.Sized.Internal.BitVector.Bit" || 
+               -- Inlines projections out of constraint-tuples (e.g. HiddenClockReset) 
+               "GHC.Classes" `Text.isPrefixOf` nm 
+       _ -> False 
+  
+ isInteresting _ _ _ _ = False 
     l2m = go []
       where
         go _  []     = []
@@ -2292,3 +2376,181 @@ flattenLet (TransformContext is0 _) letrec@(Letrec _ _) = do
     go _ b = return [b]
 
 flattenLet _ e = return e
+
+-- | Split apart (global) function arguments that contain types that we
+-- want to separate off, e.g. Clocks. Works on both the definition side (i.e. the
+-- lambda), and the call site (i.e. the application of the global variable). e.g.
+-- turns
+--
+-- > f :: (Clock System, Reset System) -> Signal System Int
+--
+-- into
+--
+-- > f :: Clock System -> Reset System -> Signal System Int
+separateArguments :: HasCallStack => NormRewrite
+separateArguments ctx@(TransformContext is0 _) e@(Lam b eb0) = do
+  tcm <- Lens.view tcCache
+  case shouldSplit tcm (varType b) of
+    Just (dc,argTys@(_:_:_)) -> do
+      let nm      = mkDerivedName ctx (nameOcc (varName b))
+          bs0     = map (`mkLocalId` nm) argTys
+          (is1,bs1) = List.mapAccumL newBinder is0 bs0
+          subst   = extendIdSubst (mkSubst is1) b (mkApps dc (map (Left . Var) bs1))
+          eb1     = substTm "separateArguments" subst eb0
+      changed (mkLams eb1 bs1)
+    _ ->
+      return e
+ where
+  newBinder isN0 x =
+    let x'   = uniqAway isN0 x
+        isN1 = extendInScopeSet isN0 x'
+    in  (isN1,x')
+
+separateArguments (TransformContext is0 _) e@(collectArgsTicks -> (Var g, args, ticks))
+  | isGlobalId g = do
+  -- We ensure that both the type of the global variable reference is updated
+  -- to take into account the changed arguments, and that we apply the global
+  -- function with the split apart arguments.
+  let (argTys0,resTy) = splitFunForallTy (varType g)
+  (concat -> args1, Monoid.getAny -> hasChanged)
+    <- listen (mapM (uncurry splitArg) (zip argTys0 args))
+  if hasChanged then
+    let (argTys1,args2) = unzip args1
+        gTy = mkPolyFunTy resTy argTys1
+    in  return (mkApps (mkTicks (Var g {varType = gTy}) ticks) args2)
+  else
+    return e
+
+ where
+  -- Split a single argument
+  splitArg
+    :: Either TyVar Type
+    -- The quantifier/function argument type of the global variable
+    -> Either Term Type
+    -- The applied type argument or term argument
+    -> NormalizeSession [(Either TyVar Type,Either Term Type)]
+  splitArg tv arg@(Right _)    = return [(tv,arg)]
+  splitArg ty arg@(Left tmArg) = do
+    tcm <- Lens.view tcCache
+    let argTy = termType tcm tmArg
+    case shouldSplit tcm argTy of
+      Just (_,argTys@(_:_:_)) -> do
+        tmArgs <- mapM (mkSelectorCase ($(curLoc) ++ "splitArg") is0 tcm tmArg 1)
+                       [0..length argTys - 1]
+        changed (map ((ty,) . Left) tmArgs)
+      _ ->
+        return [(ty,arg)]
+
+separateArguments _ e = return e
+
+-- | Remove all undefined alternatives from case expressions, replacing them
+-- with the value of another defined alternative. If there is one defined
+-- alternative, the entire expression is replaced with that alternative. If
+-- there are no defined alternatives, the entire expression is replaced with
+-- a call to 'errorX'.
+--
+-- e.g. It converts
+--
+--     case x of
+--       D1 a -> f a
+--       D2   -> undefined
+--       D3   -> undefined
+--
+-- to
+--
+--     let subj = x
+--         a    = case subj of
+--                  D1 a -> field0
+--      in f a
+--
+-- where fieldN is an internal variable referring to the nth argument of a
+-- data constructor.
+--
+xOptimize :: HasCallStack => NormRewrite
+xOptimize (TransformContext is0 _) e@(Case subj ty alts) = do
+  runXOpt <- Lens.view aggressiveXOpt
+
+  if runXOpt then do
+    defPart <- partitionM (isPrimError . snd) alts
+
+    case defPart of
+      ([], _)    -> return e
+      (_, [])    -> changed (Prim "Clash.XException.errorX" (PrimInfo ty WorkConstant))
+      (_, [alt]) -> xOptimizeSingle is0 subj alt
+      (_, defs)  -> xOptimizeMany is0 subj ty defs
+  else
+    return e
+
+xOptimize _ e = return e
+
+-- Return an expression equivalent to the alternative given. When only one
+-- alternative is defined the result of this function is used to replace the
+-- case expression.
+--
+xOptimizeSingle :: InScopeSet -> Term -> Alt -> NormalizeSession Term
+xOptimizeSingle is subj (DataPat dc tvs vars, expr) = do
+  tcm    <- Lens.view tcCache
+  subjId <- mkInternalVar is "subj" (termType tcm subj)
+
+  let fieldTys = fmap varType vars
+  lets <- Monad.zipWithM (mkFieldSelector is subjId dc tvs fieldTys) vars [0..]
+
+  changed (Letrec ((subjId, subj) : lets) expr)
+
+xOptimizeSingle _ _ (_, expr) = changed expr
+
+-- Given a list of alternatives which are defined, create a new case
+-- expression which only ever returns a defined value.
+--
+xOptimizeMany
+  :: HasCallStack
+  => InScopeSet
+  -> Term
+  -> Type
+  -> [Alt]
+  -> NormalizeSession Term
+xOptimizeMany is subj ty defs@(d:ds)
+  | isAnyDefault defs = changed (Case subj ty defs)
+  | otherwise = do
+      newAlt <- xOptimizeSingle is subj d
+      changed (Case subj ty $ ds <> [(DefaultPat, newAlt)])
+ where
+  isAnyDefault :: [Alt] -> Bool
+  isAnyDefault = any ((== DefaultPat) . fst)
+
+xOptimizeMany _ _ _ [] =
+  error $ $(curLoc) ++ "Report as bug: xOptimizeMany error: No defined alternatives"
+
+mkFieldSelector
+  :: MonadUnique m
+  => InScopeSet
+  -> Id 
+  -- ^ subject id
+  -> DataCon
+  -> [TyVar]
+  -> [Type]
+  -- ^ concrete types of fields
+  -> Id
+  -> Int
+  -> m LetBinding
+mkFieldSelector is0 subj dc tvs fieldTys nm index = do
+  fields <- mapM (\ty -> mkInternalVar is0 "field" ty) fieldTys
+  let alt = (DataPat dc tvs fields, Var $ fields !! index)
+  return (nm, Case (Var subj) (fieldTys !! index) [alt])
+
+-- Check whether a term is really a black box primitive representing an error.
+-- Such values are undefined and are removed in X Optimization.
+--
+isPrimError :: Term -> NormalizeSession Bool
+isPrimError (collectArgs -> (Prim nm _, _)) = do
+  prim <- Lens.use (extra . primitives . Lens.at nm)
+
+  case prim >>= extractPrim of
+    Just p  -> return (isErr p)
+    Nothing -> return False
+ where
+  isErr BlackBox{template=(BBTemplate [Err _])} = True
+  isErr _ = False
+
+isPrimError _ = return False
+

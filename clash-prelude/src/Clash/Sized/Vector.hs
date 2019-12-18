@@ -10,6 +10,7 @@ Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 {-# LANGUAGE DataKinds            #-}
 {-# LANGUAGE FlexibleInstances    #-}
 {-# LANGUAGE GADTs                #-}
+{-# LANGUAGE InstanceSigs         #-}
 {-# LANGUAGE KindSignatures       #-}
 {-# LANGUAGE MagicHash            #-}
 {-# LANGUAGE PatternSynonyms      #-}
@@ -111,6 +112,7 @@ import Data.Constraint            ((:-)(..), Dict (..))
 import Data.Constraint.Nat        (leZero)
 import Data.Data
   (Data (..), Constr, DataType, Fixity (..), Typeable, mkConstr, mkDataType)
+import Data.Either                (isLeft)
 import Data.Default.Class         (Default (..))
 import qualified Data.Foldable    as F
 import Data.Kind                  (Type)
@@ -133,6 +135,8 @@ import qualified Prelude          as P
 import Test.QuickCheck            (Arbitrary (..), CoArbitrary (..))
 import Unsafe.Coerce              (unsafeCoerce)
 
+import Clash.Annotations.Primitive
+  (Primitive(InlinePrimitive), HDL(..))
 import Clash.Promoted.Nat
   (SNat (..), SNatLE (..), UNat (..), compareSNat, leToPlus, pow2SNat,
    snatProxy, snatToInteger, subSNat, withSNat, toUNat)
@@ -142,7 +146,7 @@ import Clash.Sized.Index          (Index)
 
 import Clash.Class.BitPack        (packXWith, BitPack (..))
 import Clash.XException
-  (ShowX (..), NFDataX (..), showsX, showsPrecXWith, seqX)
+  (ShowX (..), NFDataX (..), showsX, showsPrecXWith, seqX, isX)
 
 {- $setup
 >>> :set -XDataKinds
@@ -245,6 +249,17 @@ instance (KnownNat n, Typeable a, Data a) => Data (Vec n a) where
   toConstr Nil        = cNil
   toConstr (Cons _ _) = cCons
   dataTypeOf _        = tVec
+
+  gfoldl
+    :: (forall d b. Data d => c (d -> b) -> d -> c b)
+    -> (forall g. g -> c g)
+    -> Vec n a
+    -> c (Vec n a)
+  gfoldl f z xs = case compareSNat (SNat @n) (SNat @0) of
+    SNatLE -> case leZero @n of
+                  Sub Dict -> z Nil
+    SNatGT -> let (y :> ys) = xs
+              in (z @(a -> Vec (n-1) a -> Vec n a) (:>) `f` y `f` ys)
 
 tVec :: DataType
 tVec = mkDataType "Vec" [cNil, cCons]
@@ -357,6 +372,14 @@ instance (NFDataX a, KnownNat n) => NFDataX (Vec n a) where
     -- a recursive function.
     seqX (foldl (\() -> rnfX) () v) ()
 
+  hasUndefined v =
+    if isLeft (isX v) then True else go v
+   where
+    go :: forall m b . (NFDataX b, KnownNat m) => Vec m b -> Bool
+    go Nil = False
+    go (x `Cons` xs) = hasUndefined x || hasUndefined xs
+
+  ensureSpine = map ensureSpine . lazyV
 
 {-# INLINE singleton #-}
 -- | Create a vector of one element
@@ -1000,6 +1023,9 @@ fold f vs = fold' (toList vs)
       where
         (ys,zs) = P.splitAt (P.length xs `div` 2) xs
 {-# NOINLINE fold #-}
+{-# ANN fold (InlinePrimitive VHDL "[ { \"BlackBoxHaskell\" : { \"name\" : \"Clash.Sized.Vector.fold\", \"templateFunction\" : \"Clash.Primitives.Sized.Vector.foldBBF\"}} ]") #-}
+{-# ANN fold (InlinePrimitive Verilog "[ { \"BlackBoxHaskell\" : { \"name\" : \"Clash.Sized.Vector.fold\", \"templateFunction\" : \"Clash.Primitives.Sized.Vector.foldBBF\"}} ]") #-}
+{-# ANN fold (InlinePrimitive SystemVerilog "[ { \"BlackBoxHaskell\" : { \"name\" : \"Clash.Sized.Vector.fold\", \"templateFunction\" : \"Clash.Primitives.Sized.Vector.foldBBF\"}} ]") #-}
 
 -- | 'scanl' is similar to 'foldl', but returns a vector of successive reduced
 -- values from the left:
@@ -1856,9 +1882,9 @@ lengthS _ = SNat
 lazyV :: KnownNat n
       => Vec n a
       -> Vec n a
-lazyV = lazyV' (repeat undefined)
+lazyV = lazyV' (repeat ())
   where
-    lazyV' :: Vec n a -> Vec n a -> Vec n a
+    lazyV' :: Vec n () -> Vec n a -> Vec n a
     lazyV' Nil           _  = Nil
     lazyV' (_ `Cons` xs) ys = head ys `Cons` lazyV' xs (tail ys)
 {-# NOINLINE lazyV #-}
@@ -2132,7 +2158,7 @@ smap f xs = reverse
                   Nil (reverse xs)
 {-# INLINE smap #-}
 
-instance (KnownNat n, KnownNat (BitSize a), BitPack a) => BitPack (Vec n a) where
+instance (KnownNat n, BitPack a) => BitPack (Vec n a) where
   type BitSize (Vec n a) = n * (BitSize a)
   pack   = packXWith (concatBitVector# . map pack)
   unpack = map unpack . unconcatBitVector#

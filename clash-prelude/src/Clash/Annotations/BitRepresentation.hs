@@ -43,6 +43,7 @@ type BitMask  = Integer
 type Value    = Integer
 type Size     = Int
 
+-- | BitMask used to mask fields
 type FieldAnn = BitMask
 
 -- | Lift values inside of 'TH.Q' to a Template Haskell expression
@@ -105,6 +106,9 @@ liftQ = (>>= TH.lift)
 -- underlying @Color@ field of @Just@ by passing /[0b11]/ to ConstrRepr. This
 -- indicates that the first field is encoded in the first and second bit of the
 -- whole datatype (0b11).
+-- 
+-- __NB__: BitPack for a custom encoding can be derived using 
+-- 'Clash.Annotations.BitRepresentation.Deriving.deriveBitPack'.
 data DataReprAnn =
   DataReprAnn
     -- Type this annotation is for:

@@ -32,13 +32,12 @@ where
 
 -- External Modules
 import           Control.Lens                ((^.), (%~), (&), (%=))
-import           Control.Monad.RWS.Lazy      (RWS)
-import qualified Control.Monad.RWS.Lazy      as RWS
+import           Control.Monad.RWS.Strict    (RWS)
+import qualified Control.Monad.RWS.Strict    as RWS
 import qualified Data.ByteString.Char8       as Char8
 import           Data.Hashable               (Hashable (..))
-import           Data.HashMap.Lazy           (HashMap)
-import qualified Data.HashMap.Lazy           as HashMap
-import qualified Data.HashMap.Strict         as HSM
+import           Data.HashMap.Strict         (HashMap)
+import qualified Data.HashMap.Strict         as HashMap
 import           Data.Maybe                  (catMaybes,fromMaybe,listToMaybe)
 #if !MIN_VERSION_base(4,11,0)
 import           Data.Semigroup
@@ -131,7 +130,7 @@ data GHC2CoreState
 makeLenses ''GHC2CoreState
 
 emptyGHC2CoreState :: GHC2CoreState
-emptyGHC2CoreState = GHC2CoreState C.emptyUniqMap HSM.empty
+emptyGHC2CoreState = GHC2CoreState C.emptyUniqMap HashMap.empty
 
 newtype SrcSpanRB = SrcSpanRB {unSrcSpanRB :: SrcSpan}
 
@@ -335,9 +334,21 @@ coreToTerm primMap unlocs = term
         go "Clash.Magic.suffixName" args
           | [Type nmTy,_aTy,f] <- args
           = C.Tick <$> (C.NameMod C.SuffixName <$> coreToType nmTy) <*> term f
+        go "Clash.Magic.suffixNameFromNat" args
+          | [Type nmTy,_aTy,f] <- args
+          = C.Tick <$> (C.NameMod C.SuffixName <$> coreToType nmTy) <*> term f
+        go "Clash.Magic.suffixNameP" args
+          | [Type nmTy,_aTy,f] <- args
+          = C.Tick <$> (C.NameMod C.SuffixNameP <$> coreToType nmTy) <*> term f
+        go "Clash.Magic.suffixNameFromNatP" args
+          | [Type nmTy,_aTy,f] <- args
+          = C.Tick <$> (C.NameMod C.SuffixNameP <$> coreToType nmTy) <*> term f
         go "Clash.Magic.setName" args
           | [Type nmTy,_aTy,f] <- args
           = C.Tick <$> (C.NameMod C.SetName <$> coreToType nmTy) <*> term f
+        go "Clash.Magic.noDeDup" args
+          | [_aTy,f] <- args
+          = C.Tick C.NoDeDup <$> term f
 
         go _ _ = term' e
     term' (Var x)                 = var x
@@ -455,12 +466,12 @@ coreToTerm primMap unlocs = term
             Just Nothing ->
               -- Was guarded by "DontTranslate". We don't know yet if Clash will
               -- actually use it later on, so we don't err here.
-              return $ C.Prim xNameS (C.PrimInfo xType C.WorkAlways)
+              return $ C.Prim xNameS (C.PrimInfo xType C.WorkVariable)
             Nothing
               | x `elem` unlocs
-              -> return (C.Prim xNameS (C.PrimInfo xType C.WorkAlways))
+              -> return (C.Prim xNameS (C.PrimInfo xType C.WorkVariable))
               | pack "$cshow" `isInfixOf` xNameS
-              -> return (C.Prim xNameS (C.PrimInfo xType C.WorkAlways))
+              -> return (C.Prim xNameS (C.PrimInfo xType C.WorkVariable))
               | otherwise
               -> C.Var <$> coreToId x
 

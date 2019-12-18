@@ -35,6 +35,7 @@ module Clash.Core.Type
   , typeKind
   , mkTyConTy
   , mkFunTy
+  , mkPolyFunTy
   , mkTyConApp
   , splitFunTy
   , splitFunTys
@@ -82,7 +83,8 @@ import           PrelNames
 import           PrelNames
   (integerTyConKey, typeNatAddTyFamNameKey, typeNatExpTyFamNameKey,
    typeNatLeqTyFamNameKey, typeNatMulTyFamNameKey, typeNatSubTyFamNameKey,
-   typeNatCmpTyFamNameKey)
+   typeNatCmpTyFamNameKey,
+   typeSymbolAppendFamNameKey, typeSymbolCmpTyFamNameKey)
 import           SrcLoc                 (wiredInSrcSpan)
 import           Unique                 (getKey)
 
@@ -302,6 +304,16 @@ splitFunForallTy = go []
     go args (tyView -> FunTy arg res) = go (Right arg:args) res
     go args ty                        = (reverse args,ty)
 
+-- | Make a polymorphic function type out of a result type and a list of
+-- quantifiers and function argument types
+mkPolyFunTy
+  :: Type
+  -- ^ Result type
+  -> [Either TyVar Type]
+  -- ^ List of quantifiers and function argument types
+  -> Type
+mkPolyFunTy = foldr (either ForAllTy mkFunTy)
+
 -- | Split a poly-function type in a: list of type-binders and argument types,
 -- and the result type. Looks through 'Signal' and type functions.
 splitCoreFunForallTy :: TyConMap
@@ -490,6 +502,18 @@ reduceTypeFamily tcm (tyView -> TyConApp tc tys)
         EQ -> Name User "GHC.Types.EQ" (getKey ordEQDataConKey) wiredInSrcSpan
         GT -> Name User "GHC.Types.GT" (getKey ordGTDataConKey) wiredInSrcSpan
 
+  | nameUniq tc == getKey typeSymbolCmpTyFamNameKey -- "GHC.TypeNats.CmpSymbol"
+  , [s1, s2] <- mapMaybe (symLitView tcm) tys
+  = Just $ ConstTy $ TyCon $
+      case compare s1 s2 of
+        LT -> Name User "GHC.Types.LT" (getKey ordLTDataConKey) wiredInSrcSpan
+        EQ -> Name User "GHC.Types.EQ" (getKey ordEQDataConKey) wiredInSrcSpan
+        GT -> Name User "GHC.Types.GT" (getKey ordGTDataConKey) wiredInSrcSpan
+
+  | nameUniq tc == getKey typeSymbolAppendFamNameKey  -- GHC.TypeLits.AppendSymbol"
+  , [s1, s2] <- mapMaybe (symLitView tcm) tys
+  = Just (LitTy (SymTy (s1 ++ s2)))
+
   | nameOcc tc `elem` ["GHC.TypeLits.Extra.FLog", "GHC.TypeNats.FLog"]
   , [i1, i2] <- mapMaybe (litView tcm) tys
   , i1 > 1
@@ -547,6 +571,11 @@ litView :: TyConMap -> Type -> Maybe Integer
 litView _ (LitTy (NumTy i))                = Just i
 litView m (reduceTypeFamily m -> Just ty') = litView m ty'
 litView _ _ = Nothing
+
+symLitView :: TyConMap -> Type -> Maybe String
+symLitView _ (LitTy (SymTy s))                = Just s
+symLitView m (reduceTypeFamily m -> Just ty') = symLitView m ty'
+symLitView _ _ = Nothing
 
 -- | The type @forall a . a@
 undefinedTy ::Type

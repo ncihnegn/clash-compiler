@@ -30,6 +30,7 @@ Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 module Clash.Class.BitPack
   ( BitPack (..)
   , bitCoerce
+  , bitCoerceMap
   , boolToBV
   , boolToBit
   , bitToBool
@@ -70,7 +71,7 @@ import Clash.XException
 -}
 
 -- | Convert to and from a 'BitVector'
-class BitPack a where
+class KnownNat (BitSize a) => BitPack a where
   -- | Number of 'Clash.Sized.BitVector.Bit's needed to represents elements
   -- of type @a@
   --
@@ -149,10 +150,26 @@ packXWith f x =
 -- 59
 -- >>> pack (59 :: Unsigned 6)
 -- 11_1011
-bitCoerce :: (BitPack a, BitPack b, BitSize a ~ BitSize b)
-          => a
-          -> b
+bitCoerce
+  :: (BitPack a, BitPack b, BitSize a ~ BitSize b)
+  => a
+  -> b
 bitCoerce = unpack . pack
+
+-- | Map a value by first coercing to another type through its bit representation.
+--
+-- >>> pack (-5 :: Signed 32)
+-- 1111_1111_1111_1111_1111_1111_1111_1011
+-- >>> bitCoerceMap @(Vec 4 (BitVector 8)) (replace 1 0) (-5 :: Signed 32)
+-- -16711685
+-- >>> pack (-16711685 :: Signed 32)
+-- 1111_1111_0000_0000_1111_1111_1111_1011
+bitCoerceMap
+  :: forall a b . (BitPack a, BitPack b, BitSize a ~ BitSize b)
+  => (a -> a)
+  -> b
+  -> b
+bitCoerceMap f = bitCoerce . f . bitCoerce
 
 instance BitPack Bool where
   type BitSize Bool = 1
@@ -264,7 +281,7 @@ instance BitPack () where
   pack   _ = minBound
   unpack _ = ()
 
-instance (KnownNat (BitSize a), KnownNat (BitSize b), BitPack a, BitPack b) =>
+instance (BitPack a, BitPack b) =>
     BitPack (a,b) where
   type BitSize (a,b) = BitSize a + BitSize b
   pack = let go (a,b) = pack a ++# pack b in packXWith go
@@ -371,23 +388,14 @@ instance GBitPack U1 where
 
 -- Instances derived using Generic
 instance ( BitPack a
-         , KnownNat (BitSize a)
          , BitPack b
-         , KnownNat (BitSize b)
          ) => BitPack (Either a b)
 
-instance ( BitPack a
-         , KnownNat (BitSize a)
-         ) => BitPack (Maybe a)
+instance BitPack a => BitPack (Maybe a)
 
 #if MIN_VERSION_base(4,12,0)
-instance ( BitPack a
-         , KnownNat (BitSize a)
-         ) => BitPack (Complex a)
-
-instance ( BitPack a
-         , KnownNat (BitSize a)
-         ) => BitPack (Down a)
+instance BitPack a => BitPack (Complex a)
+instance BitPack a => BitPack (Down a)
 #endif
 
 -- | Zero-extend a 'Bool'ean value to a 'BitVector' of the appropriate size.

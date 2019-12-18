@@ -23,6 +23,7 @@ Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 module Clash.Explicit.Testbench
   ( -- * Testbench functions for circuits
     assert
+  , assertBitVector
   , ignoreFor
   , stimuliGenerator
 
@@ -51,9 +52,9 @@ import Clash.Promoted.Symbol (SSymbol (..))
 import Clash.Explicit.Signal
   (Clock, Reset, System, Signal, clockPeriod, toEnable, fromList, register,
   unbundle, unsafeSynchronizer, veryUnsafeSynchronizer)
-import Clash.Signal.Internal (Clock (..))
+import Clash.Signal.Internal (Clock (..), Reset (..))
 import Clash.Signal
-  (mux, DomainResetKind, ResetKind(Asynchronous), KnownDomain, Reset(..),
+  (mux, DomainResetKind, ResetKind(Asynchronous), KnownDomain,
   Enable)
 import Clash.Sized.Index     (Index)
 import Clash.Sized.Internal.BitVector

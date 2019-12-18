@@ -36,7 +36,7 @@ import Data.Function                  as X (on)
 import Data.Hashable                  (Hashable)
 import Data.HashMap.Lazy              (HashMap)
 import qualified Data.HashMap.Lazy    as HashMapL
-import Data.Maybe                     (fromMaybe)
+import Data.Maybe                     (fromMaybe, listToMaybe, catMaybes)
 import Data.Text.Prettyprint.Doc
 import Data.Text.Prettyprint.Doc.Render.String
 import Data.Version                   (Version)
@@ -47,6 +47,7 @@ import Control.Lens
 import Debug.Trace                    (trace)
 import GHC.Base                       (Int(..),isTrue#,(==#),(+#))
 import GHC.Integer.Logarithms         (integerLogBase#)
+import qualified GHC.LanguageExtensions.Type as LangExt
 import GHC.Stack                      (HasCallStack, callStack, prettyCallStack)
 import Type.Reflection                (tyConPackage, typeRepTyCon, typeOf)
 import qualified Language.Haskell.TH  as TH
@@ -128,7 +129,7 @@ pprDebugAndThen cont heading prettyMsg =
   doc = sep [heading, nest 2 prettyMsg]
 
 -- | A class that can generate unique numbers
-class MonadUnique m where
+class Monad m => MonadUnique m where
   -- | Get a new unique
   getUniqueM :: m Int
 
@@ -217,6 +218,11 @@ traceIf True  msg = trace msg
 traceIf False _   = id
 {-# INLINE traceIf #-}
 
+-- | A version of 'concatMap' that works with a monadic predicate.
+concatMapM :: Monad m => (a -> m [b]) -> [a] -> m [b]
+concatMapM f as = concat <$> sequence (map f as)
+{-# INLINE concatMapM #-}
+
 -- | Monadic version of 'Data.List.partition'
 partitionM :: Monad m
            => (a -> m Bool)
@@ -264,11 +270,30 @@ indexMaybe [] _     = Nothing
 indexMaybe (x:_)  0 = Just x
 indexMaybe (_:xs) n = indexMaybe xs (n-1)
 
+-- | Same as 'indexNote' with last two arguments swapped
+indexNote'
+  :: HasCallStack
+  => String
+  -- ^ Error message to display
+  -> Int
+  -- ^ Index /n/
+  -> [a]
+  -- ^ List to index
+  -> a
+  -- ^ Error or element /n/
+indexNote' = flip . indexNote
+
 -- | Unsafe indexing, return a custom error message when indexing fails
-indexNote :: String
-          -> [a]
-          -> Int
-          -> a
+indexNote
+  :: HasCallStack
+  => String
+  -- ^ Error message to display
+  -> [a]
+  -- ^ List to index
+  -> Int
+  -- ^ Index /n/
+  -> a
+  -- ^ Error or element /n/
 indexNote note = \xs i -> fromMaybe (error note) (indexMaybe xs i)
 
 -- | Safe version of 'head'
@@ -401,3 +426,76 @@ uncurry3
   -> d
 uncurry3 = \f (a,b,c) -> f a b c
 {-# INLINE uncurry3 #-}
+
+allM :: (Monad m) => (a -> m Bool) -> [a] -> m Bool
+allM _ [] = return True
+allM p (x:xs) = do
+  q <- p x
+  if q then
+    allM p xs
+  else
+    return False
+
+traceWith :: (a -> String) -> a -> a
+traceWith f a = trace (f a) a
+
+traceShowWith :: Show b => (a -> b) -> a -> a
+traceShowWith f a = trace (show (f a)) a
+
+-- | Left-biased choice on maybes
+orElse :: Maybe a -> Maybe a -> Maybe a
+orElse x@(Just _) _y = x
+orElse _x y = y
+
+-- | Left-biased choice on maybes
+orElses :: [Maybe a] -> Maybe a
+orElses = listToMaybe . catMaybes
+
+-- These language extensions are used for
+--  * the interactive session inside clashi
+--  * compiling files with clash
+--  * running output tests with runghc
+--  * compiling (local) Template/Blackbox functions with Hint
+wantedLanguageExtensions, unwantedLanguageExtensions :: [LangExt.Extension]
+wantedLanguageExtensions =
+  [ LangExt.BinaryLiterals
+  , LangExt.ConstraintKinds
+  , LangExt.DataKinds
+  , LangExt.DeriveAnyClass
+  , LangExt.DeriveGeneric
+  , LangExt.DeriveLift
+  , LangExt.DerivingStrategies
+  , LangExt.ExplicitForAll
+  , LangExt.ExplicitNamespaces
+  , LangExt.FlexibleContexts
+  , LangExt.FlexibleInstances
+  , LangExt.KindSignatures
+  , LangExt.MagicHash
+  , LangExt.MonoLocalBinds
+  , LangExt.QuasiQuotes
+  , LangExt.ScopedTypeVariables
+  , LangExt.TemplateHaskell
+  , LangExt.TemplateHaskellQuotes
+  , LangExt.TypeApplications
+  , LangExt.TypeFamilies
+  , LangExt.TypeOperators
+#if !MIN_VERSION_ghc(8,6,0)
+  , LangExt.TypeInType
+#endif
+  ]
+
+unwantedLanguageExtensions =
+  [ LangExt.ImplicitPrelude
+  , LangExt.MonomorphismRestriction
+#if MIN_VERSION_ghc(8,6,0)
+  , LangExt.StarIsType
+#endif
+  , LangExt.Strict
+  , LangExt.StrictData
+  ]
+
+filterOnFst :: (a -> Bool) -> [(a, b)] -> [b]
+filterOnFst f xs = map snd (filter (f . fst) xs)
+
+filterOnSnd :: (b -> Bool) -> [(a, b)] -> [a]
+filterOnSnd f xs = map fst (filter (f . snd) xs)

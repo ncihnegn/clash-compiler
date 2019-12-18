@@ -15,23 +15,27 @@ module Clash.Driver.Types where
 -- For Int/Word size
 #include "MachDeps.h"
 
-import Data.Text         (Text)
+import           BasicTypes                     (InlineSpec)
+import qualified Data.Set                       as Set
+import           Data.Text                      (Text)
+import           SrcLoc                         (SrcSpan)
+import           Util                           (OverridingBool(..))
 
-import BasicTypes        (InlineSpec)
-import SrcLoc            (SrcSpan)
+import           Clash.Core.Term                (Term)
+import           Clash.Core.Var                 (Id)
+import           Clash.Core.VarEnv              (VarEnv)
 
-import Clash.Core.Term   (Term)
-import Clash.Core.Var    (Id)
-import Clash.Core.VarEnv (VarEnv)
+import           Clash.Netlist.BlackBox.Types   (HdlSyn (..))
 
-import Clash.Netlist.BlackBox.Types (HdlSyn (..))
 
-import Util (OverridingBool(..))
+-- A function binder in the global environment.
+--
+type Binding = (Id, SrcSpan, InlineSpec, Term)
 
 -- | Global function binders
 --
--- Global functions cannot be mutually recursive, only self-recursive
-type BindingMap = VarEnv (Id,SrcSpan,InlineSpec,Term)
+-- Global functions cannot be mutually recursive, only self-recursive.
+type BindingMap = VarEnv Binding
 
 -- | Debug Message Verbosity
 data DebugLevel
@@ -42,7 +46,9 @@ data DebugLevel
   | DebugFinal
   -- ^ Show completely normalized expressions
   | DebugName
-  -- ^ Names of applied transformations
+  -- ^ Show names of applied transformations
+  | DebugTry
+  -- ^ Show names of tried AND applied transformations
   | DebugApplied
   -- ^ Show sub-expressions after a successful rewrite
   | DebugAll
@@ -54,6 +60,7 @@ data ClashOpts = ClashOpts { opt_inlineLimit :: Int
                            , opt_inlineFunctionLimit :: Word
                            , opt_inlineConstantLimit :: Word
                            , opt_dbgLevel    :: DebugLevel
+                           , opt_dbgTransformations :: Set.Set String
                            , opt_cachehdl    :: Bool
                            , opt_cleanhdl    :: Bool
                            , opt_primWarn    :: Bool
@@ -87,6 +94,10 @@ data ClashOpts = ClashOpts { opt_inlineLimit :: Int
                            -- * /Just (Just x)/: replace undefined's by /x/ in
                            -- the HDL
                            , opt_checkIDir   :: Bool
+                           , opt_aggressiveXOpt :: Bool
+                           -- ^ Enable aggressive X optimization, which may
+                           -- remove undefineds from generated HDL by replaced
+                           -- with defined alternatives.
                            }
 
 
@@ -94,6 +105,7 @@ defClashOpts :: ClashOpts
 defClashOpts
   = ClashOpts
   { opt_dbgLevel            = DebugNone
+  , opt_dbgTransformations  = Set.empty
   , opt_inlineLimit         = 20
   , opt_specLimit           = 20
   , opt_inlineFunctionLimit = 15
@@ -114,6 +126,7 @@ defClashOpts
   , opt_ultra               = False
   , opt_forceUndefined      = Nothing
   , opt_checkIDir           = True
+  , opt_aggressiveXOpt      = False
   }
 
 -- | Information about the generated HDL between (sub)runs of the compiler

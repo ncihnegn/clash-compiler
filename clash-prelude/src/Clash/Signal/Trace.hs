@@ -26,16 +26,16 @@ mainCounter :: SystemClockResetEnable => Signal System (Signed 64)
 mainCounter = traceSignal1 "main" counter
   where
     counter =
-      register 0 (fmap succ' $ bundle (subcounter,counter))
+      register 0 (fmap succ' $ bundle (subCounter,counter))
 
     succ' (sc, c)
       | sc == maxBound = c + 1
       | otherwise      = c
 
 -- | Collect traces, and dump them to a VCD file.
-main :: SystemClockResetEnable => IO ()
+main :: IO ()
 main = do
-  let cntrOut = exposeClockResetEnable mainCounter systemClockGen systemResetGen
+  let cntrOut = exposeClockResetEnable mainCounter systemClockGen systemResetGen enableGen
   vcd <- dumpVCD (0, 100) cntrOut ["main", "sub"]
   case vcd of
     Left msg ->
@@ -147,7 +147,6 @@ traceMap# = unsafePerformIO (newIORef Map.empty)
 
 mkTrace
   :: HasCallStack
-  => KnownNat (BitSize a)
   => BitPack a
   => NFDataX a
   => Signal dom a
@@ -160,8 +159,7 @@ mkTrace signal = sample (unsafeToTup . pack <$> signal)
 -- was previously registered.
 traceSignal#
   :: forall dom a
-   . ( KnownNat (BitSize a)
-     , BitPack a
+   . ( BitPack a
      , NFDataX a
      , Typeable a )
   => IORef TraceMap
@@ -195,8 +193,7 @@ traceSignal# traceMap period traceName signal =
 -- an error.
 traceVecSignal#
   :: forall dom n a
-   . ( KnownNat (BitSize a)
-     , KnownNat n
+   . ( KnownNat n
      , BitPack a
      , NFDataX a
      , Typeable a )
@@ -226,7 +223,6 @@ traceVecSignal# traceMap period vecTraceName (unbundle -> vecSignal) =
 traceSignal
   :: forall dom  a
    . ( KnownDomain dom
-     , KnownNat (BitSize a)
      , BitPack a
      , NFDataX a
      , Typeable a )
@@ -250,8 +246,7 @@ traceSignal traceName signal =
 -- multiple clocks. Use 'traceSignal' when working with circuits that have
 -- multiple clocks.
 traceSignal1
-  :: ( KnownNat (BitSize a)
-     , BitPack a
+  :: ( BitPack a
      , NFDataX a
      , Typeable a )
   => String
@@ -273,7 +268,6 @@ traceSignal1 traceName signal =
 traceVecSignal
   :: forall dom a  n
    . ( KnownDomain dom
-     , KnownNat (BitSize a)
      , KnownNat n
      , BitPack a
      , NFDataX a
@@ -299,8 +293,7 @@ traceVecSignal traceName signal =
 -- multiple clocks. Use 'traceSignal' when working with circuits that have
 -- multiple clocks.
 traceVecSignal1
-  :: ( KnownNat (BitSize a)
-     , KnownNat n
+  :: ( KnownNat n
      , BitPack a
      , NFDataX a
      , Typeable a )
@@ -411,36 +404,28 @@ dumpVCD## (offset, cycles) traceMap now
   headerWire w l n = map Text.pack ["$var wire", show w, [l], n, "$end"]
   initValues       = map Text.pack $ zipWith ($) formatters inits
 
-  -- Guard against (partially) undefined bitvectors:
-  toIntegers :: Int -> [[Value]] -> [[Integer]]
-  toIntegers _ [] = []
-  toIntegers !cyclen (xs:xss) =
-    zipWith vToInteger traceNames xs : toIntegers (cyclen + 1) xss
-   where
-    vToInteger _traceName (0, v) = v
-    vToInteger traceName (mask, v) =
-      error $ "dumpVCD can't handle (partially) undefined values yet, but "
-           ++ "encountered one at cycle " ++ show cyclen ++ " of traced signal "
-           ++ "labeled " ++ show traceName ++ ". Mask was " ++ show mask
-           ++ ", value was " ++ show v ++ "."
-
   formatters = zipWith format widths labels
-  inits = map head (toIntegers 0 valuess')
-  tails = map changed (toIntegers 0 valuess')
+  inits = map head valuess'
+  tails = map changed valuess'
 
   -- | Format single value according to VCD spec
-  format :: Width -> Char -> Integer -> String
-  format 1 label 0   = ['0', label, '\n']
-  format 1 label 1   = ['1', label, '\n']
-  format 1 label val =
-    error $ "Width of " ++ show label ++ " was " ++ show val
-  format n label val =
-    let b2b b = if b then '1' else '0' in
-    "b" ++ map (b2b . testBit val) (reverse [0..n-1]) ++ " " ++ [label]
+  format :: Width -> Char -> Value -> String
+  format 1 label (0,0)   = ['0', label, '\n']
+  format 1 label (0,1)   = ['1', label, '\n']
+  format 1 label (1,_)   = ['x', label, '\n']
+  format 1 label (mask,val) =
+    error $ "Can't format 1 bit wide value for " ++ show label ++ ": value " ++ show val ++ " and mask " ++ show mask 
+  format n label (mask,val) =
+    "b" ++ map digit (reverse [0..n-1]) ++ " " ++ [label]
+    where
+      digit d = case (testBit mask d, testBit val d) of
+        (False,False) -> '0'
+        (False,True)  -> '1'
+        (True,_)      -> 'x'
 
   -- | Given a list of values, return a list of list of bools indicating
   -- if a value changed. The first value is *not* included in the result.
-  changed :: [Integer] -> [(Changed, Integer)]
+  changed :: [Value] -> [(Changed, Value)]
   changed (s:ss) = zip (zipWith (/=) (s:ss) ss) ss
   changed []     = []
 
@@ -452,7 +437,7 @@ dumpVCD## (offset, cycles) traceMap now
         let pre = Text.concat ["#", n, "\n"] in
         fmap (Text.append pre) t
 
-  bodyPart :: [(Changed, Integer)] -> Maybe Text.Text
+  bodyPart :: [(Changed, Value)] -> Maybe Text.Text
   bodyPart values =
     let formatted  = [(c, f v) | (f, (c,v)) <- zip formatters values]
         formatted' = map (Text.pack . snd) $ filter fst $ formatted in

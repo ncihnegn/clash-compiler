@@ -18,14 +18,23 @@ aliases:
         if [ -n "$CIRCLE_PR_NUMBER" ]; then
           .ci/setup.sh
         fi
+  - &cache_calc_key
+    run:
+      name: Calculate cache key
+      command: |
+        if [ -n "$CIRCLE_PR_NUMBER" ]; then
+          md5sum .circleci/config.yml cabal.project .ci/cabal.project.local */*.cabal > .circleci_cachekey
+        else
+          echo not running > .circleci_cachekey
+        fi
   - &cache_restore
     restore_cache:
       keys:
-        - cabal-store-{{ .Environment.CIRCLE_JOB }}-{{ checksum ".circleci/config.yml" }}-{{ checksum "cabal.project" }}
-        - cabal-store-{{ .Environment.CIRCLE_JOB }}-
+        - cache-{{ .Environment.CIRCLE_JOB }}-{{ checksum ".circleci_cachekey" }}
+        - cache-{{ .Environment.CIRCLE_JOB }}-
   - &cache_save
     save_cache:
-      key: cabal-store-{{ .Environment.CIRCLE_JOB }}-{{ checksum ".circleci/config.yml" }}-{{ checksum "cabal.project" }}
+      key: cache-{{ .Environment.CIRCLE_JOB }}-{{ checksum ".circleci_cachekey" }}
       paths:
         - cabal-store
         - ~/.stack
@@ -89,10 +98,11 @@ aliases:
       - *merge_pullrequest
       - *submodules
       - *setup
+      - *cache_calc_key
       - *cache_restore
       - *build
-      - *run_tests
       - *cache_save
+      - *run_tests
   - &build_with_stack
     docker:
       - image: leonschoorl/clash-ci-image:trusty
@@ -100,6 +110,7 @@ aliases:
       - checkout
       - *merge_pullrequest
       - *submodules
+      - *cache_calc_key
       - *cache_restore
       - *stack_build
       - *cache_save
@@ -121,30 +132,18 @@ workflows:
   version: 2
   build_and_test_clash:
     jobs:
-      - ghc-8.2.2
       - ghc-8.4.4
-      - ghc-8.4.4-singular-hidden
-      - ghc-8.6.5
+      - ghc-8.6.5-singular-hidden
+      # - ghc-8.6.5
       - ghc-8.8.1
       - stack-build
       - nix-build
 
 jobs:
-  ghc-8.2.2:
-    environment:
-      <<: *env
-      GHC: ghc-8.2.2
-    <<: *build_default
   ghc-8.4.4:
     environment:
       <<: *env
       GHC: ghc-8.4.4
-    <<: *build_default
-  ghc-8.4.4-singular-hidden:
-    environment:
-      <<: *env
-      GHC: ghc-8.4.4
-      MULTIPLE_HIDDEN: no
     <<: *build_default
   ghc-8.6.5:
     environment:
@@ -155,6 +154,12 @@ jobs:
     environment:
       <<: *env
       GHC: ghc-8.8.1
+    <<: *build_default
+  ghc-8.6.5-singular-hidden:
+    environment:
+      <<: *env
+      GHC: ghc-8.6.5
+      MULTIPLE_HIDDEN: no
     <<: *build_default
   stack-build:
     environment:

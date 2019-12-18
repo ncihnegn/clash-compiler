@@ -10,7 +10,7 @@ sed "s/^ghci/ghc -fno-code/" clash-dev > clash-dev-test
 sh clash-dev-test
 
 # Check whether version numbers in snap / clash-{prelude,lib,ghc} are the same
-cabal_files="clash-prelude/clash-prelude.cabal clash-lib/clash-lib.cabal clash-ghc/clash-ghc.cabal clash-term/clash-term.cabal"
+cabal_files="clash-prelude/clash-prelude.cabal clash-lib/clash-lib.cabal clash-ghc/clash-ghc.cabal clash-cores/clash-cores.cabal"
 snapcraft_file="bindist/linux/snap/snap/snapcraft.yaml"
 versions=$(grep "^[vV]ersion" $cabal_files $snapcraft_file | grep -Eo '[0-9]+(\.[0-9]+)+')
 
@@ -39,8 +39,8 @@ if [[ ${tag_version} != "" && ${version} != ${tag_version} ]]; then
         echo "\$CI_COMMIT_TAG should start with a 'v'. Found: ${CI_COMMIT_TAG}"
         exit 1;
     fi
-fi   
+fi
 
 # Run actual tests
-cabal new-test clash-cosim clash-prelude
-cabal new-run -- clash-testsuite -j$THREADS --hide-successes
+cabal new-test clash-cores clash-cosim clash-prelude clash-lib
+cabal new-run -- clash-testsuite -j$THREADS --hide-successes -p "/.VHDL./ || /.Verilog./"
